@@ -2,6 +2,7 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import re
 
 class SoftwareUpdater:
     def __init__(self, root):
@@ -113,12 +114,15 @@ class SoftwareUpdater:
                 if line.strip() and not line.startswith('-'):
                     parts = [p.strip() for p in line.split('  ') if p.strip()]
                     if len(parts) >= 4:
-                        self.updates.append({
-                            'name': parts[0],
-                            'id': parts[1],
-                            'installed_version': parts[2],
-                            'available_version': parts[3]
-                        })
+                        # Validate available version (should not be 'winget' or invalid)
+                        available_version = parts[3]
+                        if available_version.lower() != 'winget' and re.match(r'.*\d.*', available_version):
+                            self.updates.append({
+                                'name': parts[0],
+                                'id': parts[1],
+                                'installed_version': parts[2],
+                                'available_version': available_version
+                            })
             
             # Update GUI in main thread
             self.root.after(0, self._display_updates)
