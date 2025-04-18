@@ -1,0 +1,7 @@
+dist/
+dist
+build
+/dist
+/build
+*.spec
+notifiier.py
