@@ -154,17 +154,28 @@ class SoftwareUpdater:
                     break
             lines = lines[start_index:]
             self.updates = []
-            
             for line in lines:
                 if line.strip() and not line.startswith('-'):
-                    parts = [p.strip() for p in line.split('  ') if p.strip()]
+                    line = line.replace('winget', '')
+                    pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
+
+                    match = re.match(pattern, line.strip())
+                    if match:
+                        parts = [
+                            match.group(1).strip(),
+                            match.group(2).strip(),
+                            match.group(3).strip(),
+                            match.group(4).strip()
+                        ]
+                    else:
+                        parts = []               
                     if len(parts) >= 4:
                         available_version = parts[3]
-                        if 'winget' not in available_version.lower() and re.match(r'.*\d.*', available_version):
-                            package_id = parts[1]
-                            if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
-                                logging.info(f"Skipped fake update: {package_id} version {available_version}")
-                                continue
+                        package_id = parts[1]
+                        if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
+                            logging.info(f"Skipped fake update: {package_id} version {available_version}")
+                            continue
+                        else:
                             self.updates.append({
                                 'name': parts[0],
                                 'id': parts[1],

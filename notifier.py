@@ -26,20 +26,12 @@ class UpdateNotifier:
                 return {}
         return {}
 
-    def _save_fake_updates(self, package_id, package_version):
-        """Save fake updates to the JSON file"""
-        try:
-            self.fake_updates[package_id] = package_version
-            with open(self.fake_updates_file, 'w') as f:
-                json.dump(self.fake_updates, f, indent=4)
-        except IOError as e:
-            pass
-
     def show_notification(self, updatable_app):
         """Show notification with the number of available updates"""
+        plural = "s" if updatable_app != 1 else ""
         notification.notify(
-            title="New Version Available!",
-            message=f"{updatable_app} Update{'s' if updatable_app != 1 else ''} Available",
+            title=f"{updatable_app} Software Update{plural} Available!",
+            message="Open Software Updater app to install new versions.",
             app_name="Software Updater",
             timeout=5
         )
@@ -61,46 +53,44 @@ class UpdateNotifier:
             lines = lines[start_index:]
             self.updates = []
             
-            
+            total_lines = -1
             for line in lines:
                 if line.strip() and not line.startswith('-'):
+                    total_lines += 1
+                    line = line.replace('winget', '')
                     print(line)
-                    print(line.split('  '))
-                    print()
-                    parts = [p.strip() for p in line.split('  ') if p.strip()]
+                    pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
+
+                    match = re.match(pattern, line.strip())
+                    if match:
+                        parts = [
+                            match.group(1).strip(),
+                            match.group(2).strip(),
+                            match.group(3).strip(),
+                            match.group(4).strip()
+                        ]
+                    else:
+                        parts = []                                            
                     if len(parts) >= 4:
                         available_version = parts[3]
-                        if 'winget' not in available_version.lower() and re.match(r'.*\d.*', available_version):
-                            package_id = parts[1]
-                            if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
-                                continue
+                        
+                        if parts[1] in self.fake_updates.keys() and self.fake_updates[parts[1]] == available_version:
+                            total_lines -= 1
+                        
+                        else:
                             self.updates.append({
                                 'name': parts[0],
                                 'id': parts[1],
                                 'installed_version': parts[2],
                                 'available_version': available_version
-                            })
-            
-            if self.updates:
-                self.show_notification(len(self.updates))
+                                })
+            print(len(self.updates))
+            if total_lines:
+                self.show_notification(total_lines)
             
         except subprocess.CalledProcessError as e:
             pass
 
-    def _test_updates(self):
-        """Test each update to detect fake updates"""
-        for update in self.updates[:]:  # Copy to avoid modifying during iteration
-            package_id = update['id']
-            package_version = update['available_version']
-            try:
-                result = subprocess.run(['winget', 'upgrade', '--id', package_id, 
-                                       '--accept-package-agreements', '--accept-source-agreements'], 
-                                       capture_output=True, text=True, check=True)
-            except subprocess.CalledProcessError as e:
-                stdout = e.stdout.strip() if e.stdout else ""
-                stderr = e.stderr.strip() if e.stderr else ""
-                self._save_fake_updates(package_id, package_version)
-                self.updates.remove(update)
 
 if __name__ == "__main__":
     app = UpdateNotifier()

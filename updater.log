@@ -1,1 +1,64 @@
-2025-04-19 02:38:06,051 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:21:01,435 - INFO - Loaded fake updates: {}
+2025-04-19 03:21:02,559 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:21:09,471 - ERROR - Update error for package VideoLAN.VLC: stdout=- 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria., stderr=
+2025-04-19 03:21:09,476 - INFO - Successfully saved fake updates: {'VideoLAN.VLC': '3.0.21'}
+2025-04-19 03:21:09,476 - INFO - Removed package at index 1 from updates list
+2025-04-19 03:21:09,476 - INFO - Handled fake update for VideoLAN.VLC version 3.0.21
+2025-04-19 03:21:10,972 - ERROR - Update failed: Error updating software: - 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria.
+2025-04-19 03:24:01,042 - INFO - Loaded fake updates: {'VideoLAN.VLC': '3.0.21'}
+2025-04-19 03:24:02,181 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:24:02,181 - INFO - Skipped fake update: VideoLAN.VLC version 3.0.21
+2025-04-19 03:24:06,135 - ERROR - Update error for package Discord.Discord: stdout=- 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+The package cannot be upgraded using winget. Please use the method provided by the publisher for upgrading this package., stderr=
+2025-04-19 03:24:06,138 - INFO - Successfully saved fake updates: {'VideoLAN.VLC': '3.0.21', 'Discord.Discord': '1.0.9188'}
+2025-04-19 03:24:06,138 - INFO - Removed package at index 1 from updates list
+2025-04-19 03:24:06,138 - INFO - Handled fake update for Discord.Discord version 1.0.9188
+2025-04-19 03:24:07,228 - ERROR - Update failed: Error updating software: - 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+The package cannot be upgraded using winget. Please use the method provided by the publisher for upgrading this package.
+2025-04-19 03:35:06,995 - INFO - Loaded fake updates: {'VideoLAN.VLC': '3.0.01', 'Discord.Discord': '1.0.9188'}
+2025-04-19 03:35:08,116 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:35:08,117 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
+2025-04-19 03:35:17,288 - ERROR - Update error for package VideoLAN.VLC: stdout=- 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria., stderr=
+2025-04-19 03:35:17,293 - INFO - Successfully saved fake updates: {'VideoLAN.VLC': '3.0.21', 'Discord.Discord': '1.0.9188'}
+2025-04-19 03:35:17,293 - INFO - Removed package at index 3 from updates list
+2025-04-19 03:35:17,294 - INFO - Handled fake update for VideoLAN.VLC version 3.0.21
+2025-04-19 03:35:18,387 - ERROR - Update failed: Error updating software: - 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria.
+2025-04-19 03:36:34,580 - INFO - Loaded fake updates: {'VideoLAN.VLC': '3.0.21', 'Discord.Discord': '1.0.9188'}
+2025-04-19 03:36:35,713 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:36:35,714 - INFO - Skipped fake update: VideoLAN.VLC version 3.0.21
+2025-04-19 03:36:35,714 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
+2025-04-19 03:37:39,788 - INFO - Successfully updated package: SoftDeluxe.FreeDownloadManager
+2025-04-19 03:37:39,788 - INFO - Removed package at index 4 from updates list
+2025-04-19 03:37:45,477 - INFO - Update completed successfully: All updates completed successfully
+2025-04-19 03:38:05,257 - INFO - Loaded fake updates: {'VideoLAN.VLC': '3.0.21', 'Discord.Discord': '1.0.9188'}
+2025-04-19 03:38:06,382 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:38:06,382 - INFO - Skipped fake update: VideoLAN.VLC version 3.0.21
+2025-04-19 03:38:06,382 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
