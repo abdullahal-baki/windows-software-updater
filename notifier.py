@@ -1,15 +1,21 @@
 import subprocess
 import re
-from plyer import notification
+import sys
 import json
 import os
+from win10toast import ToastNotifier
+
 
 class UpdateNotifier:
     def __init__(self):
         # Initialize variables
         self.updates = []
-        self.fake_updates_file = "fake_updates.json"
+        self.fake_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\fake_updates.json"
         self.fake_updates = self._load_fake_updates()
+        
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        self.icon_path = os.path.join(base_path, 'icon.ico')
+        self.toaster = ToastNotifier()
         
         # Check for updates on startup
         self.check_for_updates()
@@ -26,14 +32,15 @@ class UpdateNotifier:
                 return {}
         return {}
 
+
     def show_notification(self, updatable_app):
-        """Show notification with the number of available updates"""
         plural = "s" if updatable_app != 1 else ""
-        notification.notify(
-            title=f"{updatable_app} Software Update{plural} Available!",
-            message="Open Software Updater app to install new versions.",
-            app_name="Software Updater",
-            timeout=5
+        self.toaster.show_toast(
+            f"{updatable_app} Software Update{plural} Available!",
+            "Open Software Updater app to install new versions.",
+            icon_path=self.icon_path,  # ✅ Custom icon!
+            duration=5,
+            threaded=True
         )
 
     def check_for_updates(self):

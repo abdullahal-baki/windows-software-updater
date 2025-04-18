@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
@@ -376,5 +377,17 @@ class SoftwareUpdater:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    icon_path = os.path.join(base_path, 'icon.ico')
+
+    root.iconbitmap(icon_path)
+    
     app = SoftwareUpdater(root)
     root.mainloop()
+    
+# pyinstaller --onefile --noconsole  --icon=icon.ico  --add-data 'icon.ico;.' --name=Updater main.py
+
+
+# pyinstaller --onefile --noconsole --icon=icon.ico  --add-data 'icon.ico;.' --name='Update Notifier' notifier.py
+
+

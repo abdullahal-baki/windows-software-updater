@@ -62,3 +62,41 @@ No installed package found matching input criteria.
 2025-04-19 03:38:06,382 - INFO - Successfully ran winget upgrade command
 2025-04-19 03:38:06,382 - INFO - Skipped fake update: VideoLAN.VLC version 3.0.21
 2025-04-19 03:38:06,382 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
+2025-04-19 03:40:08,837 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:40:13,376 - ERROR - Update error for package VideoLAN.VLC: stdout=- 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria., stderr=
+2025-04-19 03:40:13,395 - INFO - Successfully saved fake updates: {'VideoLAN.VLC': '3.0.21'}
+2025-04-19 03:40:13,396 - INFO - Removed package at index 3 from updates list
+2025-04-19 03:40:13,396 - INFO - Handled fake update for VideoLAN.VLC version 3.0.21
+2025-04-19 03:40:15,763 - ERROR - Update failed: Error updating software: - 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+No installed package found matching input criteria.
+2025-04-19 03:40:40,839 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:40:46,815 - ERROR - Update error for package Discord.Discord: stdout=- 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+The package cannot be upgraded using winget. Please use the method provided by the publisher for upgrading this package., stderr=
+2025-04-19 03:40:46,820 - INFO - Successfully saved fake updates: {'Discord.Discord': '1.0.9188'}
+2025-04-19 03:40:46,820 - INFO - Removed package at index 4 from updates list
+2025-04-19 03:40:46,821 - INFO - Handled fake update for Discord.Discord version 1.0.9188
+2025-04-19 03:40:47,831 - ERROR - Update failed: Error updating software: - 
+                                                                                                                        
+
+   - 
+                                                                                                                        
+The package cannot be upgraded using winget. Please use the method provided by the publisher for upgrading this package.
+2025-04-19 03:40:52,523 - INFO - Loaded fake updates: {'Discord.Discord': '1.0.9188'}
+2025-04-19 03:40:53,656 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:40:53,657 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
+2025-04-19 03:49:02,440 - INFO - Loaded fake updates: {'Discord.Discord': '1.0.9188'}
+2025-04-19 03:49:03,586 - INFO - Successfully ran winget upgrade command
+2025-04-19 03:49:03,587 - INFO - Skipped fake update: Discord.Discord version 1.0.9188
