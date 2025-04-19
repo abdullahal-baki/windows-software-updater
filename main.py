@@ -298,6 +298,7 @@ class SoftwareUpdater:
                     if index is not None:
                         # Single update case
                         self.root.after(0, self._remove_updated_package, index)
+                        self.root.after(0, self._stop_progress)
                         self.root.after(0, self._update_complete, True, f"Successfully updated {package_id}")
                         return  # Exit after single update
                     else:
@@ -311,6 +312,7 @@ class SoftwareUpdater:
                         if index is not None:
                             # Single fake update case
                             self.root.after(0, self._handle_fake_update, index, package_id)
+                            self.root.after(0, self._stop_progress)
                             return
                         else:
                             # Batch fake update case
@@ -321,27 +323,29 @@ class SoftwareUpdater:
                         success = False
                         error_message = stderr or stdout or "Unknown error occurred"
                         if index is not None:
-                            update_index = next((idx for idx, update in enumerate(self.updates) if update['id'] == package_id), None)
-                            self.root.after(0, self._handle_fake_update, update_index, package_id) 
+                            self.root.after(0, self._handle_fake_update, index, package_id)
+                            self.root.after(0, self._stop_progress)
                             self.root.after(0, self._update_complete, False, f"Error updating {package_id}: {error_message}")
-                            
                             return
                         else:
                             self.root.after(0, lambda: self.status_label.config(text=f"Error updating {package_id}"))
             
             # If we get here, it's a batch update that completed
             if success:
+                self.root.after(0, self._stop_progress)
                 self.root.after(0, self._update_complete, True, "All updates completed successfully")
         
         except subprocess.CalledProcessError as e:
             stdout = e.stdout.strip() if e.stdout else ""
             stderr = e.stderr.strip() if e.stderr else ""
             error_message = stderr or stdout or "Unknown error occurred"
+            self.root.after(0, self._stop_progress)
             self.root.after(0, self._update_complete, False, f"Error updating software: {error_message}")
         
         except Exception as e:
+            self.root.after(0, self._stop_progress)
             self.root.after(0, self._update_complete, False, f"Unexpected error: {e}")
-    
+
     def _handle_fake_update(self, index, package_id):
         """Handle a fake update by removing it and recording it"""
         try:
@@ -362,6 +366,7 @@ class SoftwareUpdater:
             if self.updates:
                 self.update_all_button.config(state=tk.NORMAL)
         except Exception as e:
+            self._stop_progress()
             self._update_complete(False, f"Error handling fake update: {e}")
 
     def _remove_updated_package(self, index):
@@ -398,10 +403,8 @@ class SoftwareUpdater:
     def _stop_progress(self):
         """Stop the progress bar"""
         try:
-            if self.progress['mode'] == 'indeterminate':
-                self.progress.stop()
-            self.progress.config(mode='determinate')
-            self.progress['value'] = 0
+            self.progress.stop()
+            self.progress.config(mode='determinate', value=0)
         except Exception as e:
             print(f"Error stopping progress bar: {e}")
 
