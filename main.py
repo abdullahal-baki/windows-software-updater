@@ -8,11 +8,13 @@ from plyer import notification
 import json
 import os
 
+import requests
+
 class SoftwareUpdater:
     def __init__(self, root):
         self.root = root
         self.root.title("Windows Software Updater")
-        self.root.geometry("930x600")
+        self.root.geometry("1200x600")
         
         # Configure styles
         self.style = ttk.Style()
@@ -52,16 +54,18 @@ class SoftwareUpdater:
         self.tree_scroll = ttk.Scrollbar(self.tree_frame)
         self.tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.tree = ttk.Treeview(self.tree_frame, columns=('name', 'current_version', 'new_version', 'update'), 
+        self.tree = ttk.Treeview(self.tree_frame, columns=('name', 'current_version', 'new_version','file_size', 'update'), 
                                 show='headings', yscrollcommand=self.tree_scroll.set)
         self.tree.heading('name', text='Software Name')
         self.tree.heading('current_version', text='Current Version')
         self.tree.heading('new_version', text='Available Version')
+        self.tree.heading('file_size', text='New Version Size')
         self.tree.heading('update', text='Action')
         
         self.tree.column('name', width=400)
         self.tree.column('current_version', width=200)
         self.tree.column('new_version', width=200)
+        self.tree.column('file_size', width=100)
         self.tree.column('update', width=100)
         
         self.tree.pack(fill=tk.BOTH, expand=True)
@@ -141,6 +145,26 @@ class SoftwareUpdater:
                 stderr=subprocess.PIPE,
                 text=True
             )
+            
+        def get_file_size(id):
+            result = run_command_silently(['winget', 'show', id])
+            
+            match = re.search(r'Installer Url:\s*(https?://[^\s]+\.exe)', result.stdout, re.IGNORECASE)
+            if match:
+                link = match.group(1)
+                response = requests.head(link, allow_redirects=True, timeout=10)
+
+                # Fallback to GET if HEAD doesn't return Content-Length
+                if 'Content-Length' not in response.headers:
+                    response = requests.get(link, stream=True, timeout=10)
+                
+                size_bytes = int(response.headers.get('Content-Length', 0))
+                size_mb = round(size_bytes / (1024 * 1024), 2)
+                return size_mb
+            return None
+            
+            
+            
         try:
             result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
             
@@ -173,11 +197,13 @@ class SoftwareUpdater:
                         if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
                             continue
                         else:
+                            file_size = get_file_size(package_id)
                             self.updates.append({
                                 'name': parts[0],
                                 'id': parts[1],
                                 'installed_version': parts[2],
-                                'available_version': available_version
+                                'available_version': available_version,
+                                'file_size': file_size
                             })
             
             self.root.after(0, self._display_updates)
@@ -196,6 +222,7 @@ class SoftwareUpdater:
                 update['name'],
                 update['installed_version'],
                 update['available_version'],
+                f"{update['file_size']} MB" if update['file_size'] else "N/A",
                 'Update'
             ), tags=('update_row',))
         
@@ -220,7 +247,7 @@ class SoftwareUpdater:
         item = self.tree.identify_row(event.y)
         column = self.tree.identify_column(event.x)
         
-        if item and column == '#4':
+        if item and column == '#5':
             index = int(self.tree.index(item))
             self.update_single(index)
     
