@@ -7,17 +7,12 @@ import re
 from plyer import notification
 import json
 import os
-import logging
 
 class SoftwareUpdater:
     def __init__(self, root):
         self.root = root
         self.root.title("Windows Software Updater")
         self.root.geometry("930x600")
-        
-        # Set up logging
-        logging.basicConfig(filename='updater.log', level=logging.DEBUG, 
-                           format='%(asctime)s - %(levelname)s - %(message)s')
         
         # Configure styles
         self.style = ttk.Style()
@@ -94,11 +89,8 @@ class SoftwareUpdater:
         if os.path.exists(self.fake_updates_file):
             try:
                 with open(self.fake_updates_file, 'r') as f:
-                    data = json.load(f)
-                    logging.info(f"Loaded fake updates: {data}")
-                    return data
-            except (json.JSONDecodeError, IOError) as e:
-                logging.error(f"Failed to load fake updates: {e}")
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
                 return {}
         return {}
 
@@ -107,9 +99,7 @@ class SoftwareUpdater:
         try:
             with open(self.fake_updates_file, 'w') as f:
                 json.dump(self.fake_updates, f, indent=4)
-            logging.info(f"Successfully saved fake updates: {self.fake_updates}")
         except IOError as e:
-            logging.error(f"Error saving fake updates: {e}")
             self._show_error(f"Error saving fake updates: {e}")
 
     def show_notification(self, updatable_app):
@@ -143,8 +133,7 @@ class SoftwareUpdater:
         """Thread function for checking updates"""
         def run_command_silently(command):
             startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
-
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             return subprocess.run(
                 command,
                 startupinfo=startupinfo,
@@ -154,7 +143,6 @@ class SoftwareUpdater:
             )
         try:
             result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
-            logging.info("Successfully ran winget upgrade command")
             
             # Parse the output (skip header lines and footer)
             lines = result.stdout.split('\n')
@@ -169,7 +157,6 @@ class SoftwareUpdater:
                 if line.strip() and not line.startswith('-'):
                     line = line.replace('winget', '')
                     pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
-
                     match = re.match(pattern, line.strip())
                     if match:
                         parts = [
@@ -184,7 +171,6 @@ class SoftwareUpdater:
                         available_version = parts[3]
                         package_id = parts[1]
                         if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
-                            logging.info(f"Skipped fake update: {package_id} version {available_version}")
                             continue
                         else:
                             self.updates.append({
@@ -197,10 +183,8 @@ class SoftwareUpdater:
             self.root.after(0, self._display_updates)
             
         except subprocess.CalledProcessError as e:
-            logging.error(f"Error checking for updates: stdout={e.stdout}, stderr={e.stderr}")
             self.root.after(0, self._show_error, f"Error checking for updates: {e.stderr}")
         except FileNotFoundError:
-            logging.error("winget not found")
             self.root.after(0, self._show_error, "winget not found. Please install Windows Package Manager.")
         finally:
             self.root.after(0, self._stop_progress)
@@ -217,11 +201,11 @@ class SoftwareUpdater:
         
         self.tree.tag_configure('update_row', font=('Helvetica', 10))
         
-        # self.show_notification(len(self.updates))
-        
         if self.updates:
             self.status_label.config(text=f"Found {len(self.updates)} available updates")
             self.update_all_button.config(state=tk.NORMAL)
+            # Show notification only if there are updates
+            self.show_notification(len(self.updates))
         else:
             self.status_label.config(text="No updates available")
             self.update_all_button.config(state=tk.DISABLED)
@@ -276,8 +260,8 @@ class SoftwareUpdater:
         if messagebox.askyesno("Confirm Update", f"Update all {len(self.updates)} packages?\n\n{package_names}"):
             self.update_in_progress = True
             self.status_label.config(text="Updating all software...")
-            self.progress.config(mode='indeterminate')
-            self.progress.start()
+            self.progress.config(mode='determinate', maximum=len(package_ids))
+            self.progress['value'] = 0
             
             self.check_button.config(state=tk.DISABLED)
             self.update_all_button.config(state=tk.DISABLED)
@@ -288,8 +272,7 @@ class SoftwareUpdater:
         """Thread function for updating software"""
         def run_command_silently(command):
             startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
-
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             return subprocess.run(
                 command,
                 startupinfo=startupinfo,
@@ -297,29 +280,64 @@ class SoftwareUpdater:
                 stderr=subprocess.PIPE,
                 text=True
             )
+    
         try:
-            for package_id in package_ids:
-                result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
-                logging.info(f"Successfully updated package: {package_id}")
+            success = True
+            error_message = ""
+            for i, package_id in enumerate(package_ids):
+                # Use correct winget command to apply the update
+                command = ['winget', 'upgrade', package_id, '--accept-source-agreements']
+                result = run_command_silently(command)
                 
-                if index is not None:
-                    self.root.after(0, self._remove_updated_package, index)
-                    break
+                stdout = result.stdout.strip() if result.stdout else ""
+                stderr = result.stderr.strip() if result.stderr else ""
+                combined_output = (stdout + " " + stderr).lower()
+                
+                # Check for success
+                if result.returncode == 0 or "successfully upgraded" in combined_output.lower():
+                    if index is not None:
+                        # Single update case
+                        self.root.after(0, self._remove_updated_package, index)
+                        self.root.after(0, self._update_complete, True, f"Successfully updated {package_id}")
+                        return  # Exit after single update
+                    else:
+                        # Batch update case
+                        update_index = next((idx for idx, update in enumerate(self.updates) if update['id'] == package_id), None)
+                        if update_index is not None:
+                            self.root.after(0, self._remove_updated_package, update_index)
+                            self.root.after(0, lambda: self.progress.config(value=i+1))
+                else:
+                    if "no package found" in combined_output or "not installed" in combined_output:
+                        if index is not None:
+                            # Single fake update case
+                            self.root.after(0, self._handle_fake_update, index, package_id)
+                            return
+                        else:
+                            # Batch fake update case
+                            update_index = next((idx for idx, update in enumerate(self.updates) if update['id'] == package_id), None)
+                            if update_index is not None:
+                                self.root.after(0, self._handle_fake_update, update_index, package_id)
+                    else:
+                        success = False
+                        error_message = stderr or stdout or "Unknown error occurred"
+                        if index is not None:
+                            self.root.after(0, self._update_complete, False, f"Error updating {package_id}: {error_message}")
+                            return
+                        else:
+                            self.root.after(0, lambda: self.status_label.config(text=f"Error updating {package_id}"))
             
-            self.root.after(0, self._update_complete, True, "All updates completed successfully")
+            # If we get here, it's a batch update that completed
+            if success:
+                self.root.after(0, self._update_complete, True, "All updates completed successfully")
+        
         except subprocess.CalledProcessError as e:
             stdout = e.stdout.strip() if e.stdout else ""
             stderr = e.stderr.strip() if e.stderr else ""
-            combined_output = (stdout + " " + stderr).lower()
-            logging.error(f"Update error for package {package_id if package_ids else 'unknown'}: stdout={stdout}, stderr={stderr}")
-            if index is not None and ("no package found" in combined_output or "not installed" in combined_output or not combined_output):
-                self.root.after(0, self._handle_fake_update, index, package_id)
-            else:
-                error_message = stderr or stdout or "Unknown error occurred"
-                self.root.after(0, self._update_complete, False, f"Error updating software: {error_message}")
-                if index is not None:
-                    # self.root.after(0, self._remove_updated_package, index)
-                    self.root.after(0, self._handle_fake_update, index, package_id)
+            error_message = stderr or stdout or "Unknown error occurred"
+            self.root.after(0, self._update_complete, False, f"Error updating software: {error_message}")
+        
+        except Exception as e:
+            self.root.after(0, self._update_complete, False, f"Unexpected error: {e}")
     
     def _handle_fake_update(self, index, package_id):
         """Handle a fake update by removing it and recording it"""
@@ -335,15 +353,12 @@ class SoftwareUpdater:
             self.update_in_progress = False
             self._stop_progress()
             self.status_label.config(text=f"Removed fake update for {package_name}")
-            # messagebox.showwarning("Fake Update Detected", f"Fake update for {package_name} (version {package_version}) removed.")
-            logging.info(f"Handled fake update for {package_id} version {package_version}")
             
             self.check_button.config(state=tk.NORMAL)
             
             if self.updates:
                 self.update_all_button.config(state=tk.NORMAL)
         except Exception as e:
-            logging.error(f"Error handling fake update: {e}")
             self._update_complete(False, f"Error handling fake update: {e}")
 
     def _remove_updated_package(self, index):
@@ -351,12 +366,11 @@ class SoftwareUpdater:
         try:
             self.tree.delete(self.tree.get_children()[index])
             del self.updates[index]
-            logging.info(f"Removed package at index {index} from updates list")
             
             if not self.updates:
                 self.update_all_button.config(state=tk.DISABLED)
         except Exception as e:
-            logging.error(f"Error removing updated package: {e}")
+            print(f"Error removing package: {e}")
 
     def _update_complete(self, success, message):
         """Handle update completion"""
@@ -365,48 +379,44 @@ class SoftwareUpdater:
         
         if success:
             self.status_label.config(text=message)
-            messagebox.showinfo("Success", message)
-            logging.info(f"Update completed successfully: {message}")
+            if not self.updates:  # Only show success message if all updates are done
+                messagebox.showinfo("Success", message)
         else:
             self.status_label.config(text="Update failed")
             messagebox.showerror("Error", message)
-            logging.error(f"Update failed: {message}")
         
         self.check_button.config(state=tk.NORMAL)
         
         if self.updates:
             self.update_all_button.config(state=tk.NORMAL)
-    
+        else:
+            self.update_all_button.config(state=tk.DISABLED)
+
     def _stop_progress(self):
         """Stop the progress bar"""
         try:
-            self.progress.stop()
+            if self.progress['mode'] == 'indeterminate':
+                self.progress.stop()
             self.progress.config(mode='determinate')
             self.progress['value'] = 0
         except Exception as e:
-            logging.error(f"Error stopping progress bar: {e}")
+            print(f"Error stopping progress bar: {e}")
 
     def _show_error(self, message):
         """Display an error message"""
         self._stop_progress()
         self.status_label.config(text="Error occurred")
         messagebox.showerror("Error", message)
-        logging.error(f"Error displayed: {message}")
         self.check_button.config(state=tk.NORMAL)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    icon_path = os.path.join(base_path, 'icon.ico')
-
-    root.iconbitmap(icon_path)
+    try:
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        icon_path = os.path.join(base_path, 'icon.ico')
+        root.iconbitmap(icon_path)
+    except Exception as e:
+        print(f"Error loading icon: {e}")
     
     app = SoftwareUpdater(root)
     root.mainloop()
-    
-# pyinstaller --onefile --noconsole  --icon=icon.ico  --add-data 'icon.ico;.' --name=Updater main.py
-
-
-# pyinstaller --onefile --noconsole --icon=icon.ico  --add-data 'icon.ico;.' --name='Update Notifier' notifier.py
-
-
