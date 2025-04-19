@@ -321,7 +321,10 @@ class SoftwareUpdater:
                         success = False
                         error_message = stderr or stdout or "Unknown error occurred"
                         if index is not None:
+                            update_index = next((idx for idx, update in enumerate(self.updates) if update['id'] == package_id), None)
+                            self.root.after(0, self._handle_fake_update, update_index, package_id) 
                             self.root.after(0, self._update_complete, False, f"Error updating {package_id}: {error_message}")
+                            
                             return
                         else:
                             self.root.after(0, lambda: self.status_label.config(text=f"Error updating {package_id}"))
