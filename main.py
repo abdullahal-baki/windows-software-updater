@@ -141,9 +141,19 @@ class SoftwareUpdater:
         
     def _check_for_updates_thread(self):
         """Thread function for checking updates"""
+        def run_command_silently(command):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
+
+            return subprocess.run(
+                command,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
         try:
-            result = subprocess.run(['winget', 'upgrade', '--accept-source-agreements'], 
-                                  capture_output=True, text=True, check=True)
+            result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
             logging.info("Successfully ran winget upgrade command")
             
             # Parse the output (skip header lines and footer)
@@ -276,11 +286,20 @@ class SoftwareUpdater:
     
     def _update_thread(self, package_ids, index):
         """Thread function for updating software"""
+        def run_command_silently(command):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
+
+            return subprocess.run(
+                command,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
         try:
             for package_id in package_ids:
-                result = subprocess.run(['winget', 'upgrade', '--id', package_id, 
-                                       '--accept-package-agreements', '--accept-source-agreements'], 
-                                       capture_output=True, text=True, check=True)
+                result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
                 logging.info(f"Successfully updated package: {package_id}")
                 
                 if index is not None:

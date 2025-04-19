@@ -44,10 +44,20 @@ class UpdateNotifier:
         )
 
     def check_for_updates(self):
+        def run_command_silently(command):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
+
+            return subprocess.run(
+                command,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
         """Check for available updates"""
         try:
-            result = subprocess.run(['winget', 'upgrade', '--accept-source-agreements'], 
-                                capture_output=True, text=True, check=True)
+            result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
             
             # Parse the output (skip header lines and footer)
             lines = result.stdout.split('\n')
