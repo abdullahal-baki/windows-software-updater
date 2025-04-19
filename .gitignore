@@ -9,3 +9,4 @@ updater.log
     
 # pyinstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name=Updater main.py
 lab.py
+fake_updates.json
