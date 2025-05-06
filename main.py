@@ -7,7 +7,6 @@ import re
 from plyer import notification
 import json
 import os
-
 import requests
 
 class SoftwareUpdater:
@@ -22,6 +21,7 @@ class SoftwareUpdater:
         self.style.configure("Title.TLabel", font=('Helvetica', 16, 'bold'))
         self.style.configure("Subtitle.TLabel", font=('Helvetica', 12))
         self.style.configure("Treeview.Heading", font=('Helvetica', 10, 'bold'))
+        self.style.configure("Dialog.TLabel", font=('Helvetica', 12, 'bold'), foreground='red')
         
         # Create main frame
         self.main_frame = ttk.Frame(root, padding="10")
@@ -84,6 +84,10 @@ class SoftwareUpdater:
         self.update_in_progress = False
         self.fake_updates_file = "fake_updates.json"
         self.fake_updates = self._load_fake_updates()
+        
+        # Load icon path
+        self.base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        self.icon_path = os.path.join(self.base_path, 'icon.ico')
         
         # Automatically check for updates on startup
         self.check_for_updates()
@@ -152,18 +156,35 @@ class SoftwareUpdater:
             match = re.search(r'Installer Url:\s*(https?://[^\s]+\.exe)', result.stdout, re.IGNORECASE)
             if match:
                 link = match.group(1)
-                response = requests.head(link, allow_redirects=True, timeout=10)
-
-                # Fallback to GET if HEAD doesn't return Content-Length
-                if 'Content-Length' not in response.headers:
-                    response = requests.get(link, stream=True, timeout=10)
-                
-                size_bytes = int(response.headers.get('Content-Length', 0))
-                size_mb = round(size_bytes / (1024 * 1024), 2)
-                return size_mb
+                try:
+                    response = requests.head(link, allow_redirects=True, timeout=10)
+                    if 'Content-Length' not in response.headers:
+                        response = requests.get(link, stream=True, timeout=10)
+                    size_bytes = int(response.headers.get('Content-Length', 0))
+                    size_mb = round(size_bytes / (1024 * 1024), 2)
+                    return size_mb
+                except:
+                    return None
             return None
             
-            
+        def get_executable_path(id, package_name):
+            try:
+                result = run_command_silently(['winget', 'show', '--id', id, '--exact'])
+                output = result.stdout
+                
+                # Search for Install Location
+                match = re.search(r'Install Location:\s*(.*?)\n', output, re.IGNORECASE)
+                if match:
+                    install_path = match.group(1).strip()
+                    if install_path and os.path.exists(install_path):
+                        # Look for executables matching package name or ID
+                        for root, _, files in os.walk(install_path):
+                            for file in files:
+                                if file.lower().endswith('.exe') and (package_name.lower() in file.lower() or id.lower() in file.lower()):
+                                    return os.path.join(root, file)
+                return None
+            except:
+                return None
             
         try:
             result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
@@ -194,16 +215,20 @@ class SoftwareUpdater:
                     if len(parts) >= 4:
                         available_version = parts[3]
                         package_id = parts[1]
+                        package_name = parts[0]
                         if package_id in self.fake_updates and self.fake_updates[package_id] == available_version:
                             continue
                         else:
                             file_size = get_file_size(package_id)
+                            # Get executable path at startup
+                            executable_path = get_executable_path(package_id, package_name)
                             self.updates.append({
-                                'name': parts[0],
-                                'id': parts[1],
+                                'name': package_name,
+                                'id': package_id,
                                 'installed_version': parts[2],
                                 'available_version': available_version,
-                                'file_size': file_size
+                                'file_size': file_size,
+                                'executable_path': executable_path
                             })
             
             self.root.after(0, self._display_updates)
@@ -349,10 +374,11 @@ class SoftwareUpdater:
                     else:
                         success = False
                         error_message = stderr or stdout or "Unknown error occurred"
+                        package_name = next((update['name'] for update in self.updates if update['id'] == package_id), package_id)
                         if index is not None:
                             self.root.after(0, self._handle_fake_update, index, package_id)
                             self.root.after(0, self._stop_progress)
-                            self.root.after(0, self._update_complete, False, f"Error updating {package_id}: {error_message}")
+                            self.root.after(0, self._update_complete, False, f"Error Updating {package_name}", package_id)
                             return
                         else:
                             self.root.after(0, lambda: self.status_label.config(text=f"Error updating {package_id}"))
@@ -366,12 +392,13 @@ class SoftwareUpdater:
             stdout = e.stdout.strip() if e.stdout else ""
             stderr = e.stderr.strip() if e.stderr else ""
             error_message = stderr or stdout or "Unknown error occurred"
+            package_name = package_ids[0] if package_ids else "Unknown"
             self.root.after(0, self._stop_progress)
-            self.root.after(0, self._update_complete, False, f"Error updating software: {error_message}")
+            self.root.after(0, self._update_complete, False, f"Error Updating {package_name}", package_ids[0] if package_ids else None)
         
         except Exception as e:
             self.root.after(0, self._stop_progress)
-            self.root.after(0, self._update_complete, False, f"Unexpected error: {e}")
+            self.root.after(0, self._update_complete, False, f"Unexpected error: {e}", None)
 
     def _handle_fake_update(self, index, package_id):
         """Handle a fake update by removing it and recording it"""
@@ -407,18 +434,87 @@ class SoftwareUpdater:
         except Exception as e:
             print(f"Error removing package: {e}")
 
-    def _update_complete(self, success, message):
+    def _launch_software(self, package_id):
+        """Launch the software using the pre-collected executable path"""
+        try:
+            if not package_id:
+                messagebox.showerror("Error", "No package ID provided")
+                return
+                
+            package_name = next((update['name'] for update in self.updates if update['id'] == package_id), package_id)
+            executable_path = next((update['executable_path'] for update in self.updates if update['id'] == package_id), None)
+            
+            if executable_path and os.path.exists(executable_path):
+                os.startfile(executable_path)
+                return
+            
+            # Fallback: Search Start Menu shortcuts
+            start_menu_paths = [
+                os.path.expanduser(r"~\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
+                r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+            ]
+            for start_menu in start_menu_paths:
+                for root, _, files in os.walk(start_menu):
+                    for file in files:
+                        if file.lower().endswith('.lnk') and (package_name.lower() in file.lower() or package_id.lower() in file.lower()):
+                            shortcut_path = os.path.join(root, file)
+                            try:
+                                os.startfile(shortcut_path)
+                                return
+                            except:
+                                continue
+            
+            # Final fallback: Inform user to open manually
+            messagebox.showwarning("Warning", f"Could not find executable for {package_name}. Please open the software manually.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch software: {e}")
+
+    def _update_complete(self, success, message, package_id=None):
         """Handle update completion"""
         self.update_in_progress = False
         self._stop_progress()
         
         if success:
             self.status_label.config(text=message)
-            if not self.updates:  # Only show success message if all updates are done
+            if not self.updates:
                 messagebox.showinfo("Success", message)
         else:
             self.status_label.config(text="Update failed")
-            messagebox.showerror("Error", message)
+            # Create custom dialog for error
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Update Error")
+            dialog.geometry("300x130")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+            
+            # Center the dialog on the screen
+            screen_width = dialog.winfo_screenwidth()
+            screen_height = dialog.winfo_screenheight()
+            x = (screen_width - 300) // 2
+            y = (screen_height - 130) // 2
+            dialog.geometry(f"300x130+{x}+{y}")
+            
+            # Set the program icon
+            try:
+                dialog.iconbitmap(self.icon_path)
+            except Exception as e:
+                print(f"Error setting dialog icon: {e}")
+            
+            # Create a frame for better padding and styling
+            dialog_frame = ttk.Frame(dialog, padding="10")
+            dialog_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Error message
+            ttk.Label(dialog_frame, text=message, style="Dialog.TLabel", justify=tk.CENTER, wraplength=350).pack(pady=(10, 15))
+            
+            # Button frame
+            button_frame = ttk.Frame(dialog_frame)
+            button_frame.pack(pady=10)
+            
+            # Buttons with consistent styling
+            ttk.Button(button_frame, text="Close", command=dialog.destroy, width=12).pack(side=tk.LEFT, padx=10)
+            # ttk.Button(button_frame, text="Open Software", command=lambda: [self._launch_software(package_id), dialog.destroy()], width=12).pack(side=tk.LEFT, padx=10)
         
         self.check_button.config(state=tk.NORMAL)
         
