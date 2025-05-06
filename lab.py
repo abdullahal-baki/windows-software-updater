@@ -1,22 +1,19 @@
 import re
 import subprocess
 
-from requests import request
-import requests
 
-def run_command_silently(command):
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
-
-    return subprocess.run(
-        command,
-        startupinfo=startupinfo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
 def check_for_updates():
-    
+    def run_command_silently(command):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # prevent console window
+
+        return subprocess.run(
+            command,
+            startupinfo=startupinfo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
     """Check for available updates"""
     try:
         result = run_command_silently(['winget', 'upgrade', '--accept-source-agreements'])
@@ -64,38 +61,9 @@ def check_for_updates():
                     except:
                         pass
         print(len(updates))
-        
         return updates
         
         
     except subprocess.CalledProcessError as e:
         pass
-
-
-updates = check_for_updates()
-
-
-def get_file_size(id):
-    result = run_command_silently(['winget', 'show', id])
-    
-    match = re.search(r'Installer Url:\s*(https?://[^\s]+\.exe)', result.stdout, re.IGNORECASE)
-    if match:
-        link = match.group(1)
-        response = requests.head(link, allow_redirects=True, timeout=10)
-
-        # Fallback to GET if HEAD doesn't return Content-Length
-        if 'Content-Length' not in response.headers:
-            response = requests.get(link, stream=True, timeout=10)
-        
-        size_bytes = int(response.headers.get('Content-Length', 0))
-        size_mb = round(size_bytes / (1024 * 1024), 2)
-        return size_mb
-    return None
-
-
-
-for update in updates:
-    print(update['id'])
-    
-    print(get_file_size(update['id']))
-        
+check_for_updates()
