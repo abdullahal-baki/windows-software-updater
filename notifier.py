@@ -3,7 +3,7 @@ import re
 import sys
 import json
 import os
-from win10toast import ToastNotifier
+from win10toast_click import ToastNotifier
 
 
 class UpdateNotifier:
@@ -16,6 +16,7 @@ class UpdateNotifier:
         base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
         self.icon_path = os.path.join(base_path, 'icon.ico')
         self.toaster = ToastNotifier()
+        self.updater_path = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\Updater.exe"
         
         # Check for updates on startup
         self.check_for_updates()
@@ -28,19 +29,23 @@ class UpdateNotifier:
                     data = json.load(f)
                     return data
             except (json.JSONDecodeError, IOError) as e:
-
                 return {}
         return {}
 
+    def _launch_updater(self):
+        """Launch the Updater.exe application"""
+        if os.path.exists(self.updater_path):
+            os.startfile(self.updater_path)
 
     def show_notification(self, updatable_app):
         plural = "s" if updatable_app != 1 else ""
         self.toaster.show_toast(
             f"{updatable_app} Software Update{plural} Available!",
             "Open Software Updater app to install new versions.",
-            icon_path=self.icon_path,  # ✅ Custom icon!
+            icon_path=self.icon_path,
             duration=5,
-            threaded=True
+            threaded=True,
+            callback_on_click=self._launch_updater
         )
 
     def check_for_updates(self):
@@ -62,7 +67,6 @@ class UpdateNotifier:
             # Parse the output (skip header lines and footer)
             lines = result.stdout.split('\n')
             start_index = 0
-            # print(lines)
             for i, line in enumerate(lines):
                 if line.startswith('Name') and 'Id' in line:
                     start_index = i + 1
