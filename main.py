@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 from typing import Dict, List, Optional
+from types import MethodType
 
 import requests
 import tkinter as tk
@@ -269,6 +270,7 @@ class SoftwareUpdater:
         if WinToastNotifier is not None:
             try:
                 self.completion_notifier = WinToastNotifier()
+                self._harden_notifier_callbacks()
             except Exception:
                 self.completion_notifier = None
 
@@ -329,6 +331,48 @@ class SoftwareUpdater:
         except Exception:
             # plyer may throw on unsupported platforms; ignore silently
             pass
+
+    def _harden_notifier_callbacks(self) -> None:
+        """Ensure win10toast_click callbacks return proper values and swallow errors."""
+        if not self.completion_notifier:
+            return
+        try:
+            import win10toast_click as toast_mod  # type: ignore
+        except Exception:
+            return
+
+        notifier = self.completion_notifier
+
+        def _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam):
+            try:
+                nid = (self_notifier.hwnd, 0)  # type: ignore[attr-defined]
+                toast_mod.Shell_NotifyIcon(toast_mod.NIM_DELETE, nid)
+            except Exception:
+                pass
+            try:
+                toast_mod.PostQuitMessage(0)
+            except Exception:
+                pass
+            return 0
+
+        def _safe_wnd_proc(self_notifier, hwnd, msg, wparam, lparam, **kwargs):
+            try:
+                if lparam == toast_mod.PARAM_CLICKED:
+                    callback = kwargs.get("callback")
+                    if callback:
+                        try:
+                            callback()
+                        except Exception:
+                            pass
+                    _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam)
+                elif lparam == toast_mod.PARAM_DESTROY:
+                    _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam)
+            except Exception:
+                pass
+            return 0
+
+        notifier.on_destroy = MethodType(_safe_on_destroy, notifier)  # type: ignore[assignment]
+        notifier.wnd_proc = MethodType(_safe_wnd_proc, notifier)  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # UI event handlers
