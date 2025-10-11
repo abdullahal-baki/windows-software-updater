@@ -720,13 +720,23 @@ class SoftwareUpdater:
             stderr = result.stderr.strip() if result.stderr else ""
             combined_output = (stdout + " " + stderr).lower()
             if result.returncode == 0 or "successfully upgraded" in combined_output:
-                self.root.after(0, self._remove_package_by_id, package_id)
-                self.root.after(0, lambda v=i + 1: self.progress.config(value=v))
-                # Send a completion toast notification for this package
+                # Capture the display name before the UI thread potentially removes the item
                 try:
                     update_obj = next((u for u in self.updates if u["id"] == package_id), None)
-                    pkg_name = update_obj["name"] if update_obj else package_id
-                    if self.completion_notifier:
+                    pkg_name = (
+                        update_obj.get("name", package_id)
+                        if update_obj
+                        else package_id
+                    )
+                except Exception:
+                    pkg_name = package_id
+
+                self.root.after(0, self._remove_package_by_id, package_id)
+                self.root.after(0, lambda v=i + 1: self.progress.config(value=v))
+
+                # Send a completion toast notification for this package
+                if self.completion_notifier:
+                    try:
                         self.completion_notifier.show_toast(
                             f"{pkg_name} Updated",
                             f"{pkg_name} has been successfully updated.",
@@ -734,8 +744,8 @@ class SoftwareUpdater:
                             duration=5,
                             threaded=True,
                         )
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             else:
                 if "no package found" in combined_output or "not installed" in combined_output:
                     self.root.after(0, self._handle_fake_update_by_id, package_id)
