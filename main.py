@@ -41,6 +41,12 @@ import tkinter as tk
 from plyer import notification
 from tkinter import ttk, messagebox
 
+try:
+    # Use win10toast_click for Windows toast notifications if available
+    from win10toast_click import ToastNotifier as WinToastNotifier  # type: ignore
+except Exception:
+    WinToastNotifier = None
+
 
 class SoftwareUpdater:
     """A Tkinter GUI for updating Windows software via winget.
@@ -67,7 +73,8 @@ class SoftwareUpdater:
 
         # Configure styles for a more modern look and feel.  Increase
         # row height in the treeview for better readability and adjust
-        # fonts globally via ttk.Style.
+        # fonts globally via ttk.Style.  Note that ttk widgets share
+        # style names; adjusting the treeview will not affect labels.
         self.style = ttk.Style()
         self.style.theme_use("default")
         self.style.configure(
@@ -125,7 +132,10 @@ class SoftwareUpdater:
         )
         self.update_all_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Button for updating only the selected software.
+        # Button for updating only the selected software.  This remains
+        # disabled until at least one package is available.  When
+        # pressed it looks at the current tree selection and starts a
+        # batch update for the selected items.
         self.update_selected_button = ttk.Button(
             self.button_frame,
             text="Update Selected",
@@ -155,7 +165,9 @@ class SoftwareUpdater:
         self.main_frame.grid_columnconfigure(1, weight=1)
         self.main_frame.grid_columnconfigure(2, weight=1)
 
-        # Frame for the treeview and its scrollbar.
+        # Frame for the treeview and its scrollbar.  Making this a
+        # separate frame allows the scrollbar to sit flush to the
+        # right-hand side of the table.
         self.tree_frame = ttk.Frame(self.main_frame)
         self.tree_frame.grid(row=4, column=0, columnspan=3, sticky=tk.NSEW)
         self.main_frame.grid_rowconfigure(4, weight=1)
@@ -203,11 +215,14 @@ class SoftwareUpdater:
         self.tree.bind("<Button-1>", self._handle_tree_click)
 
         # Track when the tree selection changes so we can enable or
-        # disable the 'Update Selected' button.
+        # disable the 'Update Selected' button.  Without this the
+        # button would remain enabled after all rows have been removed.
         self.tree.bind("<<TreeviewSelect>>", self._handle_selection_change)
 
         # Initialize state.  'updates' holds the list of dictionaries
-        # describing available updates.
+        # describing available updates.  'update_in_progress' is used
+        # to prevent simultaneous update operations.  The fake and
+        # excluded updates are persisted across runs.
         self.updates: List[Dict[str, Optional[str]]] = []
         self.update_in_progress = False
         self.fake_updates: Dict[str, str] = self._load_json(self.FAKE_UPDATES_FILE)
@@ -219,7 +234,20 @@ class SoftwareUpdater:
         self.base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         self.icon_path = os.path.join(self.base_path, "icon.ico")
 
+        # Create a toast notifier for update completion if win10toast_click is available.
+        # This will be used to show a notification whenever a package finishes
+        # updating successfully. If the import failed (e.g., on non-Windows
+        # platforms or when the module is missing) this attribute will be None
+        # and completion notifications will be suppressed gracefully.
+        self.completion_notifier = None
+        if WinToastNotifier is not None:
+            try:
+                self.completion_notifier = WinToastNotifier()
+            except Exception:
+                self.completion_notifier = None
+
         # Automatically check for updates when the application starts
+        # to improve UX.
         self.check_for_updates()
 
     # ------------------------------------------------------------------
@@ -227,7 +255,12 @@ class SoftwareUpdater:
     # ------------------------------------------------------------------
     @staticmethod
     def _load_json(filename: str) -> Dict:
-        """Load a JSON file from disk and return an empty dict on error."""
+        """Load a JSON file from disk and return an empty dict on error.
+
+        All persistent metadata files (fake updates and excluded updates)
+        share the same loading semantics.  When the file cannot be
+        parsed or does not exist, an empty dict is returned.
+        """
         if os.path.exists(filename):
             try:
                 with open(filename, "r", encoding="utf-8") as f:
@@ -238,15 +271,28 @@ class SoftwareUpdater:
 
     @staticmethod
     def _save_json(filename: str, data: Dict) -> None:
-        """Persist a dictionary to disk as JSON, handling IO errors."""
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        """Persist a dictionary to disk as JSON, handling IO errors.
+
+        In the unlikely event of an error during save, the user is
+        presented with a message box in the caller.
+        """
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except IOError as e:
+            raise IOError(f"Error saving JSON file '{filename}': {e}")
 
     # ------------------------------------------------------------------
     # Notification helper
     # ------------------------------------------------------------------
     def show_notification(self, updatable_count: int) -> None:
-        """Display a desktop notification about pending updates."""
+        """Display a desktop notification about pending updates.
+
+        Uses ``plyer`` to show a simple toast alert indicating how
+        many packages can be updated.  On platforms where plyer
+        notifications are not supported this function will quietly do
+        nothing.
+        """
         try:
             notification.notify(
                 title="New Version Available!",
@@ -255,13 +301,19 @@ class SoftwareUpdater:
                 timeout=5,
             )
         except Exception:
+            # plyer may throw on unsupported platforms; ignore silently
             pass
 
     # ------------------------------------------------------------------
     # UI event handlers
     # ------------------------------------------------------------------
     def check_for_updates(self) -> None:
-        """Kick off a background scan for available updates via winget."""
+        """Kick off a background scan for available updates via winget.
+
+        Disables the main control buttons while scanning, clears the
+        existing table, and starts the progress bar.  The actual work
+        happens in a separate thread to keep the GUI responsive.
+        """
         if self.update_in_progress:
             messagebox.showwarning("Warning", "An update is already in progress")
             return
@@ -283,7 +335,14 @@ class SoftwareUpdater:
         threading.Thread(target=self._check_for_updates_thread, daemon=True).start()
 
     def _check_for_updates_thread(self) -> None:
-        """Worker thread for scanning available updates via winget."""
+        """Worker thread for scanning available updates via winget.
+
+        This method calls ``winget upgrade --accept-source-agreements`` and
+        parses its output to build the list of available updates.  It
+        filters out packages present in the ``fake_updates`` and
+        ``excluded_updates`` dictionaries.  File sizes and executable
+        paths are resolved before populating the UI on the main thread.
+        """
 
         def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
             startupinfo = subprocess.STARTUPINFO()
@@ -314,7 +373,8 @@ class SoftwareUpdater:
                         size_bytes = int(response.headers.get("Content-Length", 0))
                         if size_bytes <= 0:
                             return None
-                        return round(size_bytes / (1024 * 1024), 2)
+                        size_mb = round(size_bytes / (1024 * 1024), 2)
+                        return size_mb
                     except Exception:
                         return None
             except Exception:
@@ -573,18 +633,21 @@ class SoftwareUpdater:
             f"Exclude updates for {package_name} permanently?",
         ):
             return
-        self.excluded_updates[package_id] = True
-        self._save_json(self.EXCLUDED_UPDATES_FILE, self.excluded_updates)
-        self._remove_package_by_id(package_id)
-        self.status_label.config(text=f"Excluded {package_name} from updates")
-        if self.updates:
-            self.update_all_button.config(state=tk.NORMAL)
-            self.update_selected_button.config(
-                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
-            )
-        else:
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
+        try:
+            self.excluded_updates[package_id] = True
+            self._save_json(self.EXCLUDED_UPDATES_FILE, self.excluded_updates)
+            self._remove_package_by_id(package_id)
+            self.status_label.config(text=f"Excluded {package_name} from updates")
+            if self.updates:
+                self.update_all_button.config(state=tk.NORMAL)
+                self.update_selected_button.config(
+                    state=tk.NORMAL if self.tree.selection() else tk.DISABLED
+                )
+            else:
+                self.update_all_button.config(state=tk.DISABLED)
+                self.update_selected_button.config(state=tk.DISABLED)
+        except Exception as e:
+            self._show_error(f"Error excluding package: {e}")
 
     def _remove_package_by_id(self, package_id: str) -> None:
         """Remove a package from the treeview and internal list by id."""
@@ -601,7 +664,16 @@ class SoftwareUpdater:
     # Worker thread for performing updates
     # ------------------------------------------------------------------
     def _update_thread(self, package_ids: List[str]) -> None:
-        """Background worker that iterates over a list of package ids."""
+        """Background worker that iterates over a list of package ids.
+
+        Each package is updated by executing ``winget upgrade <id>``.  The
+        result of the command is parsed for success.  On successful
+        completion the package is removed from the UI; if the update
+        fails due to a fake update ("no package found" or "not
+        installed") then the package is recorded in the fake updates
+        file.  Any other error will trigger the error dialog and abort
+        the batch.
+        """
         def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -624,6 +696,20 @@ class SoftwareUpdater:
             if result.returncode == 0 or "successfully upgraded" in combined_output:
                 self.root.after(0, self._remove_package_by_id, package_id)
                 self.root.after(0, lambda v=i + 1: self.progress.config(value=v))
+                # Send a completion toast notification for this package
+                try:
+                    update_obj = next((u for u in self.updates if u["id"] == package_id), None)
+                    pkg_name = update_obj["name"] if update_obj else package_id
+                    if self.completion_notifier:
+                        self.completion_notifier.show_toast(
+                            f"{pkg_name} Updated",
+                            f"{pkg_name} has been successfully updated.",
+                            icon_path=self.icon_path,
+                            duration=5,
+                            threaded=True,
+                        )
+                except Exception:
+                    pass
             else:
                 if "no package found" in combined_output or "not installed" in combined_output:
                     self.root.after(0, self._handle_fake_update_by_id, package_id)
@@ -649,7 +735,10 @@ class SoftwareUpdater:
         package_name = update["name"]
         package_version = update["available_version"]
         self.fake_updates[package_id] = package_version
-        self._save_json(self.FAKE_UPDATES_FILE, self.fake_updates)
+        try:
+            self._save_json(self.FAKE_UPDATES_FILE, self.fake_updates)
+        except Exception as e:
+            self._show_error(str(e))
         self._remove_package_by_id(package_id)
         self.status_label.config(text=f"Removed fake update for {package_name}")
 
