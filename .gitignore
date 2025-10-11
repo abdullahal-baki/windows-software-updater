@@ -6,7 +6,9 @@ build
 *.spec
 updater.log
 lab.py
-    
+*.pyc
 # pyinstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name=Updater main.py
 # pyinstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name="Update Notifier" notifier.py
 fake_updates.json
+excluded_updates.json
+excluded_updates.json

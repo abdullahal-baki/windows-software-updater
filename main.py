@@ -71,12 +71,77 @@ class SoftwareUpdater:
         # for the extra columns that were added for selection/exclusion.
         self.root.geometry("1200x600")
 
+        # Header bar with app title, subtitle, and primary actions
+        header_bg = "#0d6efd"
+        header_fg = "#ffffff"
+        sub_fg = "#eaf2ff"
+        self.header = tk.Frame(root, bg=header_bg)
+        self.header.pack(fill=tk.X)
+
+        icon_canvas = tk.Canvas(self.header, width=28, height=28, bg=header_bg, highlightthickness=0)
+        icon_canvas.grid(row=0, column=0, padx=(12, 8), pady=10)
+        icon_canvas.create_oval(2, 2, 26, 26, fill="#ffffff", outline="")
+        icon_canvas.create_rectangle(8, 9, 20, 12, fill=header_bg, outline="")
+        icon_canvas.create_rectangle(8, 14, 20, 17, fill=header_bg, outline="")
+
+        title_block = tk.Frame(self.header, bg=header_bg)
+        title_block.grid(row=0, column=1, sticky="w")
+        tk.Label(
+            title_block,
+            text="Windows Software Updater",
+            font=("Segoe UI", 16, "bold"),
+            fg=header_fg,
+            bg=header_bg,
+        ).pack(anchor="w")
+        tk.Label(
+            title_block,
+            text="Powered by Windows Package Manager (winget)",
+            font=("Segoe UI", 10),
+            fg=sub_fg,
+            bg=header_bg,
+        ).pack(anchor="w")
+
+        self.toolbar = ttk.Frame(self.header)
+        self.toolbar.grid(row=0, column=2, sticky="e", padx=12)
+        self.header.grid_columnconfigure(1, weight=1)
+
+        self.check_button = ttk.Button(
+            self.toolbar,
+            text="Check for Updates",
+            command=self.check_for_updates,
+        )
+        self.check_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.update_all_button = ttk.Button(
+            self.toolbar,
+            text="Update All",
+            state=tk.DISABLED,
+            command=self.update_all,
+        )
+        self.update_all_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.update_selected_button = ttk.Button(
+            self.toolbar,
+            text="Update Selected",
+            state=tk.DISABLED,
+            command=self.update_selected,
+        )
+        self.update_selected_button.pack(side=tk.LEFT)
+
+        ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
         # Configure styles for a more modern look and feel.  Increase
         # row height in the treeview for better readability and adjust
         # fonts globally via ttk.Style.  Note that ttk widgets share
         # style names; adjusting the treeview will not affect labels.
         self.style = ttk.Style()
-        self.style.theme_use("default")
+        try:
+            if "vista" in self.style.theme_names():
+                self.style.theme_use("vista")
+            else:
+                self.style.theme_use("clam")
+        except Exception:
+            self.style.theme_use("default")
         self.style.configure(
             "TButton", padding=6, relief="flat", font=("Helvetica", 10)
         )
@@ -103,46 +168,7 @@ class SoftwareUpdater:
         self.main_frame = ttk.Frame(root, padding="10")
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Title at the top of the window
-        ttk.Label(
-            self.main_frame,
-            text="Windows Software Updater",
-            style="Title.TLabel",
-        ).grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky=tk.W)
-
-        # A frame to contain all three control buttons in a single row.
-        self.button_frame = ttk.Frame(self.main_frame)
-        self.button_frame.grid(row=1, column=0, columnspan=3, sticky=tk.W)
-
-        # Button for initiating a scan for updates
-        self.check_button = ttk.Button(
-            self.button_frame,
-            text="Check for Updates",
-            command=self.check_for_updates,
-        )
-        self.check_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Button for updating all available software.  Initially
-        # disabled; it will be enabled once a scan finds updates.
-        self.update_all_button = ttk.Button(
-            self.button_frame,
-            text="Update All",
-            state=tk.DISABLED,
-            command=self.update_all,
-        )
-        self.update_all_button.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Button for updating only the selected software.  This remains
-        # disabled until at least one package is available.  When
-        # pressed it looks at the current tree selection and starts a
-        # batch update for the selected items.
-        self.update_selected_button = ttk.Button(
-            self.button_frame,
-            text="Update Selected",
-            state=tk.DISABLED,
-            command=self.update_selected,
-        )
-        self.update_selected_button.pack(side=tk.LEFT)
+        # Header moved to top bar; legacy title/buttons removed
 
         # Status label to communicate the current state to the user
         self.status_label = ttk.Label(
@@ -150,7 +176,7 @@ class SoftwareUpdater:
             text="Click 'Check for Updates' to begin",
             style="Subtitle.TLabel",
         )
-        self.status_label.grid(row=2, column=0, columnspan=3, pady=5, sticky=tk.W)
+        self.status_label.grid(row=0, column=0, columnspan=3, pady=5, sticky=tk.W)
 
         # Progress bar.  We leave it empty until a scan or update begins.
         self.progress = ttk.Progressbar(
@@ -159,7 +185,7 @@ class SoftwareUpdater:
             length=100,
             mode="determinate",
         )
-        self.progress.grid(row=3, column=0, columnspan=3, pady=10, sticky=tk.EW)
+        self.progress.grid(row=1, column=0, columnspan=3, pady=10, sticky=tk.EW)
         # Stretch progress bar across the available width
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=1)
@@ -169,8 +195,8 @@ class SoftwareUpdater:
         # separate frame allows the scrollbar to sit flush to the
         # right-hand side of the table.
         self.tree_frame = ttk.Frame(self.main_frame)
-        self.tree_frame.grid(row=4, column=0, columnspan=3, sticky=tk.NSEW)
-        self.main_frame.grid_rowconfigure(4, weight=1)
+        self.tree_frame.grid(row=2, column=0, columnspan=3, sticky=tk.NSEW)
+        self.main_frame.grid_rowconfigure(2, weight=1)
 
         # Create the vertical scrollbar
         self.tree_scroll = ttk.Scrollbar(self.tree_frame)

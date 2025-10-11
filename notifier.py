@@ -33,24 +33,16 @@ class UpdateNotifier:
         # Initialise variables
         self.updates: List[Dict[str, str]] = []
         # Path to JSON file recording fake updates
-        self.fake_updates_file = (
-            r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\fake_updates.json"
-        )
+        self.fake_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\fake_updates.json"
         # Path to JSON file recording excluded updates
-        self.excluded_updates_file = (
-            r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\excluded_updates.json"
-        )
+        self.excluded_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\excluded_updates.json"
         self.fake_updates: Dict[str, str] = self._load_json(self.fake_updates_file)
-        self.excluded_updates: Dict[str, bool] = self._load_json(
-            self.excluded_updates_file
-        )
+        self.excluded_updates: Dict[str, bool] = self._load_json(self.excluded_updates_file)
 
         # Resolve icon and updater paths relative to the bundle when frozen
         base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
         self.icon_path = os.path.join(base_path, "icon.ico")
-        self.updater_path = (
-            r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\Updater.exe"
-        )
+        self.updater_path = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\Updater.exe"
 
         self.toaster = ToastNotifier()
 
@@ -137,10 +129,9 @@ class UpdateNotifier:
                     if len(parts) >= 4:
                         name, package_id, installed_version, available_version = parts
                         # Skip fake or excluded packages entirely
-                        if (
-                            package_id in self.fake_updates
-                            and self.fake_updates[package_id] == available_version
-                        ) or (package_id in self.excluded_updates):
+                        if (package_id in self.fake_updates and self.fake_updates[package_id] == available_version) or (
+                            package_id in self.excluded_updates
+                        ):
                             continue
                         # Otherwise include in updates list
                         self.updates.append(
