@@ -36,8 +36,11 @@ class UpdateNotifier:
         self.fake_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\fake_updates.json"
         # Path to JSON file recording excluded updates
         self.excluded_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\excluded_updates.json"
+        # Path to JSON file recording skipped (per-version) updates
+        self.skipped_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\skipped_updates.json"
         self.fake_updates: Dict[str, str] = self._load_json(self.fake_updates_file)
         self.excluded_updates: Dict[str, bool] = self._load_json(self.excluded_updates_file)
+        self.skipped_updates: Dict[str, str] = self._load_json(self.skipped_updates_file)
 
         # Resolve icon and updater paths relative to the bundle when frozen
         base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +65,16 @@ class UpdateNotifier:
             except (json.JSONDecodeError, IOError):
                 return {}
         return {}
+
+    @staticmethod
+    def _save_json(path: str, data: Dict) -> None:
+        """Persist a dictionary to disk as JSON, ignoring IO errors."""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            # Best-effort for notifier; ignore write issues
+            pass
 
     # ------------------------------------------------------------------
     # Updater launcher
@@ -111,6 +124,7 @@ class UpdateNotifier:
             lines = lines[start_index:]
             self.updates = []
             count = 0
+            skipped_changed = False
             for line in lines:
                 # Skip empty and header lines
                 if line.strip() and not line.startswith("-"):
@@ -133,6 +147,15 @@ class UpdateNotifier:
                             package_id in self.excluded_updates
                         ):
                             continue
+                        # Respect per-version skip list
+                        skip_version = self.skipped_updates.get(package_id)
+                        if skip_version == available_version:
+                            # User chose to skip this exact version
+                            continue
+                        if skip_version is not None and skip_version != available_version:
+                            # Newer version available; clear the old skip entry
+                            self.skipped_updates.pop(package_id, None)
+                            skipped_changed = True
                         # Otherwise include in updates list
                         self.updates.append(
                             {
@@ -144,8 +167,12 @@ class UpdateNotifier:
                         )
                         count += 1
             # Only show notification if there are pending updates
+            print(self.updates)
             if count:
                 self.show_notification(count)
+            # Persist any cleared skip entries
+            if skipped_changed:
+                self._save_json(self.skipped_updates_file, self.skipped_updates)
         except subprocess.CalledProcessError:
             # Winget not found or another non‑zero return; silently ignore
             pass
