@@ -132,6 +132,23 @@ class SoftwareUpdater:
         )
         self.update_selected_button.pack(side=tk.LEFT)
 
+        # Button to manage permanently excluded packages
+        self.manage_exclusions_button = ttk.Button(
+            self.toolbar,
+            text="Manage Exclusions",
+            command=self.show_exclusions_view,
+        )
+        self.manage_exclusions_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Back button (visible only in exclusions view)
+        self.back_button = ttk.Button(
+            self.toolbar, text="Back", command=self.show_updates_view
+        )
+        # Hide initially; shown when managing exclusions
+        # Use pack_forget to toggle visibility cleanly
+        self.back_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.back_button.pack_forget()
+
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         # Configure styles for a more modern look and feel.  Increase
@@ -415,6 +432,204 @@ class SoftwareUpdater:
 
         # Start scan in a background thread
         threading.Thread(target=self._check_for_updates_thread, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Exclusions manager (in-place view)
+    # ------------------------------------------------------------------
+    def show_exclusions_view(self) -> None:
+        """Switch main content to the exclusions manager view."""
+        # Cache current home status to restore when returning
+        try:
+            self._home_status_cache = self.status_label.cget("text")
+        except Exception:
+            self._home_status_cache = "Click 'Check for Updates' to begin"
+        # Hide update controls while managing exclusions
+        self.check_button.config(state=tk.DISABLED)
+        self.update_all_button.config(state=tk.DISABLED)
+        self.update_selected_button.config(state=tk.DISABLED)
+        # Toggle toolbar buttons
+        try:
+            self.manage_exclusions_button.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.back_button.pack(side=tk.LEFT, padx=(8, 0))
+        except Exception:
+            pass
+
+        # Hide updates table
+        try:
+            self.tree_frame.grid_remove()
+        except Exception:
+            pass
+
+        # Build exclusions frame once
+        if not hasattr(self, "exclusions_frame") or self.exclusions_frame is None:
+            self.exclusions_frame = ttk.Frame(self.main_frame)
+            self.exclusions_frame.grid(row=2, column=0, columnspan=3, sticky=tk.NSEW)
+            excl_scroll = ttk.Scrollbar(self.exclusions_frame)
+            excl_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            self.exclusions_tree = ttk.Treeview(
+                self.exclusions_frame,
+                columns=("name", "action"),
+                show="headings",
+                yscrollcommand=excl_scroll.set,
+                selectmode="browse",
+            )
+            self.exclusions_tree.heading("name", text="Software Name")
+            self.exclusions_tree.heading("action", text="Action")
+            self.exclusions_tree.column("name", width=480, anchor="w")
+            self.exclusions_tree.column("action", width=140, anchor="center")
+            self.exclusions_tree.pack(fill=tk.BOTH, expand=True)
+            excl_scroll.config(command=self.exclusions_tree.yview)
+            # Handle click on action column
+            self.exclusions_tree.bind("<Button-1>", self._handle_exclusions_click)
+        else:
+            self.exclusions_frame.grid()
+
+        self.status_label.config(text="Manage Exclusions")
+        # Populate asynchronously
+        threading.Thread(target=self._load_exclusions_data_thread, daemon=True).start()
+
+    def show_updates_view(self) -> None:
+        """Return to the main updates view."""
+        # Hide exclusions frame
+        try:
+            if hasattr(self, "exclusions_frame") and self.exclusions_frame:
+                self.exclusions_frame.grid_remove()
+        except Exception:
+            pass
+        # Show updates table
+        try:
+            self.tree_frame.grid()
+        except Exception:
+            pass
+        # Toggle toolbar buttons
+        try:
+            self.back_button.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.manage_exclusions_button.pack(side=tk.LEFT, padx=(8, 0))
+        except Exception:
+            pass
+        # Restore button states depending on data
+        self.check_button.config(state=tk.NORMAL)
+        if self.updates:
+            self.update_all_button.config(state=tk.NORMAL)
+            self.update_selected_button.config(
+                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
+            )
+        else:
+            self.update_all_button.config(state=tk.DISABLED)
+            self.update_selected_button.config(state=tk.DISABLED)
+
+        # Restore previous home status text (or fallback)
+        try:
+            previous = getattr(self, "_home_status_cache", None)
+            if previous:
+                self.status_label.config(text=previous)
+            else:
+                # Derive a sensible default
+                if self.updates:
+                    self.status_label.config(
+                        text=f"Found {len(self.updates)} available update{'s' if len(self.updates) != 1 else ''}"
+                    )
+                else:
+                    self.status_label.config(text="Click 'Check for Updates' to begin")
+        except Exception:
+            pass
+
+    def _load_exclusions_data_thread(self) -> None:
+        """Load excluded IDs, resolve names via winget search, and populate tree."""
+        ids = list(self.excluded_updates.keys())
+        entries: List[Dict[str, str]] = []
+
+        def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            return subprocess.run(
+                command,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        for pid in ids:
+            name = ""
+            try:
+                # Prefer search table to extract display name reliably
+                res = run_command_silently(["winget", "search", "--id", pid, "--exact"])
+                out = res.stdout or ""
+                # Find the data row that contains the exact id and read the name from start up to id column
+                for line in out.splitlines():
+                    if pid in line and not line.strip().startswith(("Name", "--")):
+                        m = re.match(rf"^(.*?)\s{{2,}}{re.escape(pid)}(\s|$)", line)
+                        if m:
+                            cand = m.group(1).strip()
+                            if cand:
+                                name = cand
+                                break
+                if not name:
+                    # Fallback to 'show' parsing
+                    res2 = run_command_silently(["winget", "show", "--id", pid, "--exact"])
+                    match = re.search(r"^Name:\s*(.+)$", res2.stdout or "", re.IGNORECASE | re.MULTILINE)
+                    if match:
+                        name = match.group(1).strip()
+            except Exception:
+                pass
+            if not name:
+                name = pid
+            entries.append({"id": pid, "name": name})
+
+        def populate():
+            # Clear items and insert fresh with 'Unexclude' actions
+            try:
+                for item in self.exclusions_tree.get_children():
+                    self.exclusions_tree.delete(item)
+            except Exception:
+                pass
+            for e in entries:
+                self.exclusions_tree.insert(
+                    "",
+                    tk.END,
+                    iid=e["id"],
+                    values=(e["name"], "Unexclude"),
+                )
+            if entries:
+                self.status_label.config(text=f"Manage Exclusions - {len(entries)} item(s)")
+            else:
+                self.status_label.config(text="No excluded packages")
+
+        self.root.after(0, populate)
+
+    def _handle_exclusions_click(self, event: tk.Event) -> None:
+        item = self.exclusions_tree.identify_row(event.y)
+        column = self.exclusions_tree.identify_column(event.x)
+        if not item:
+            return
+        if column == "#2":  # Action column
+            self._unexclude_from_manager(item)
+
+    def _unexclude_from_manager(self, package_id: str) -> None:
+        if package_id in self.excluded_updates:
+            try:
+                self.excluded_updates.pop(package_id, None)
+                self._save_json(self.EXCLUDED_UPDATES_FILE, self.excluded_updates)
+            except Exception as e:
+                messagebox.showerror("Error", f"Error saving exclusions: {e}")
+                return
+        try:
+            self.exclusions_tree.delete(package_id)
+        except Exception:
+            pass
+        # Update status
+        remaining = len(self.exclusions_tree.get_children())
+        if remaining:
+            self.status_label.config(text=f"Manage Exclusions — {remaining} item(s)")
+        else:
+            self.status_label.config(text="No excluded packages")
 
     def _check_for_updates_thread(self) -> None:
         """Worker thread for scanning available updates via winget.
