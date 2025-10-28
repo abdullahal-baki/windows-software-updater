@@ -63,6 +63,9 @@ class SoftwareUpdater:
     #: JSON file used to record permanently excluded packages.  Excluded
     #: packages will not show up in the update list on subsequent scans.
     EXCLUDED_UPDATES_FILE = "excluded_updates.json"
+    #: JSON file used to record versions the user chooses to skip once.
+    #: These entries are cleared automatically when a newer version is detected.
+    SKIPPED_UPDATES_FILE = "skipped_updates.json"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -214,6 +217,7 @@ class SoftwareUpdater:
                 "file_size",
                 "update",
                 "exclude",
+                "skip",
             ),
             show="headings",
             yscrollcommand=self.tree_scroll.set,
@@ -225,14 +229,16 @@ class SoftwareUpdater:
         self.tree.heading("file_size", text="New Version Size")
         self.tree.heading("update", text="Action")
         self.tree.heading("exclude", text="Exclude")
+        self.tree.heading("skip", text="Skip Version")
         # Column widths tuned to fit the new table.  The exclude
-        # column is narrow as it only contains a link.
+        # columns are narrow as they only contain link-style actions.
         self.tree.column("name", width=350, anchor="w")
         self.tree.column("current_version", width=150, anchor="center")
         self.tree.column("new_version", width=150, anchor="center")
         self.tree.column("file_size", width=120, anchor="center")
         self.tree.column("update", width=100, anchor="center")
         self.tree.column("exclude", width=100, anchor="center")
+        self.tree.column("skip", width=110, anchor="center")
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.tree_scroll.config(command=self.tree.yview)
 
@@ -253,9 +259,8 @@ class SoftwareUpdater:
         self.updates: List[Dict[str, Optional[str]]] = []
         self.update_in_progress = False
         self.fake_updates: Dict[str, str] = self._load_json(self.FAKE_UPDATES_FILE)
-        self.excluded_updates: Dict[str, bool] = self._load_json(
-            self.EXCLUDED_UPDATES_FILE
-        )
+        self.excluded_updates: Dict[str, bool] = self._load_json(self.EXCLUDED_UPDATES_FILE)
+        self.skipped_updates: Dict[str, str] = self._load_json(self.SKIPPED_UPDATES_FILE)
 
         # Load icon path (packaged with PyInstaller if necessary)
         self.base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -309,6 +314,13 @@ class SoftwareUpdater:
                 json.dump(data, f, indent=4)
         except IOError as e:
             raise IOError(f"Error saving JSON file '{filename}': {e}")
+
+    def _persist_skipped_updates(self) -> None:
+        """Persist the skip-once selections, showing an error if the write fails."""
+        try:
+            self._save_json(self.SKIPPED_UPDATES_FILE, self.skipped_updates)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     # ------------------------------------------------------------------
     # Notification helper
@@ -475,6 +487,8 @@ class SoftwareUpdater:
                 return None
             return None
 
+        skipped_changed = False
+
         try:
             result = run_command_silently(["winget", "upgrade", "--accept-source-agreements"])
             lines = result.stdout.split("\n")
@@ -503,10 +517,14 @@ class SoftwareUpdater:
                         if (
                             package_id in self.fake_updates
                             and self.fake_updates[package_id] == available_version
-                        ) or (
-                            package_id in self.excluded_updates
-                        ):
+                        ) or (package_id in self.excluded_updates):
                             continue
+                        skip_version = self.skipped_updates.get(package_id)
+                        if skip_version == available_version:
+                            continue
+                        if skip_version is not None and skip_version != available_version:
+                            self.skipped_updates.pop(package_id, None)
+                            skipped_changed = True
                         file_size = get_file_size(package_id)
                         executable_path = get_executable_path(package_id, package_name)
                         temp_updates.append(
@@ -534,6 +552,8 @@ class SoftwareUpdater:
             )
         finally:
             self.root.after(0, self._stop_progress)
+            if skipped_changed:
+                self.root.after(0, self._persist_skipped_updates)
 
     def _display_updates(self, updates: List[Dict[str, Optional[str]]]) -> None:
         """Populate the treeview with a list of update dictionaries."""
@@ -554,6 +574,7 @@ class SoftwareUpdater:
                     file_size_str,
                     "Update",
                     "Exclude",
+                    "Skip",
                 ),
             )
         if updates:
@@ -583,6 +604,9 @@ class SoftwareUpdater:
         elif column == "#6":
             package_id = item
             self._exclude_package_by_id(package_id)
+        elif column == "#7":
+            package_id = item
+            self._skip_version_by_id(package_id)
 
     def _handle_selection_change(self, event: tk.Event) -> None:
         """Enable or disable the 'Update Selected' button based on selection."""
@@ -718,6 +742,53 @@ class SoftwareUpdater:
                 self.update_selected_button.config(state=tk.DISABLED)
         except Exception as e:
             self._show_error(f"Error excluding package: {e}")
+
+    def _skip_version_by_id(self, package_id: str) -> None:
+        """Skip the currently offered version for a package."""
+        if self.update_in_progress:
+            messagebox.showwarning("Warning", "An update is already in progress")
+            return
+        update = next((u for u in self.updates if u["id"] == package_id), None)
+        if not update:
+            return
+        package_name = update["name"]
+        available_version = update.get("available_version")
+        if not available_version:
+            messagebox.showinfo(
+                "Skip Version",
+                f"Unable to skip {package_name} because no version information is available.",
+            )
+            return
+        if self.skipped_updates.get(package_id) == available_version:
+            # Already skipped; nothing to do.
+            self._remove_package_by_id(package_id)
+            return
+        if not messagebox.askyesno(
+            "Skip This Version",
+            (
+                f"Skip version {available_version} of {package_name}?\n\n"
+                "You will see this software again when a newer version is released."
+            ),
+        ):
+            return
+        try:
+            self.skipped_updates[package_id] = available_version
+            self._save_json(self.SKIPPED_UPDATES_FILE, self.skipped_updates)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error saving skipped version: {e}")
+            return
+        self._remove_package_by_id(package_id)
+        self.status_label.config(
+            text=f"Skipped {package_name} (version {available_version})"
+        )
+        if self.updates:
+            self.update_all_button.config(state=tk.NORMAL)
+            self.update_selected_button.config(
+                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
+            )
+        else:
+            self.update_all_button.config(state=tk.DISABLED)
+            self.update_selected_button.config(state=tk.DISABLED)
 
     def _remove_package_by_id(self, package_id: str) -> None:
         """Remove a package from the treeview and internal list by id."""
