@@ -1,1197 +1,2136 @@
 """
-Improved Windows software updater GUI.
+PyQt6-based Windows software updater GUI.
 
-This module contains a Tkinter application that wraps the Windows Package
-Manager (winget) to scan for application updates and apply them.  It
-improves upon the original implementation by providing a more modern and
-flexible user interface, support for batch updating only a subset of the
-available packages, and the ability to permanently exclude specific
-packages from future scans.
-
-The application is still designed to run on Windows with winget installed.
-When run, the user is automatically presented with a list of available
-updates.  Each row of the list includes controls for updating or
-excluding the corresponding package.  Multiple rows can be selected
-(using Ctrl‑click or Shift‑click) and updated together via a dedicated
-"Update Selected" button.  Exclusions are persisted to disk and
-respected on subsequent scans.
-
-The update logic itself has not changed: packages are updated via
-``winget upgrade <package id> --accept-source-agreements`` and the
-progress bar reflects the number of operations being performed.  When a
-package is excluded, its identifier is recorded in an ``excluded_updates.json``
-file alongside any fake updates discovered at runtime.
-
-Note that this script depends on ``plyer`` for notifications and
-``requests`` for determining download sizes.  On non‑Windows platforms
-the functionality is limited; however, the GUI remains responsive thanks
-to threading and careful use of ``after`` callbacks.
+This application wraps Windows Package Manager (winget) to scan for
+available updates, apply them, and manage exclusions or skipped versions.
+It provides a custom, frameless dark UI with a minimal abstract logo and
+system tray notifications.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
 import subprocess
 import sys
-import threading
-from typing import Dict, List, Optional
-from types import MethodType
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import requests
-import tkinter as tk
-from plyer import notification
-from tkinter import ttk, messagebox
+from PyQt6.QtCore import (
+    Qt,
+    QObject,
+    QThread,
+    pyqtSignal,
+    QTimer,
+    QPoint,
+    QPropertyAnimation,
+    QEasingCurve,
+    pyqtProperty,
+)
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QIcon,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QFrame,
+    QHeaderView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QSizeGrip,
+    QSizePolicy,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-try:
-    # Use win10toast_click for Windows toast notifications if available
-    from win10toast_click import ToastNotifier as WinToastNotifier  # type: ignore
-except Exception:
-    WinToastNotifier = None
+APP_TITLE = "Windows Software Updater"
+APP_SUBTITLE = "Powered by Windows Package Manager (winget)"
+
+WINGET_TIMEOUT_SECONDS = int(os.environ.get("WSU_WINGET_TIMEOUT", "120"))
+WINGET_SHOW_TIMEOUT_SECONDS = int(os.environ.get("WSU_WINGET_SHOW_TIMEOUT", "20"))
+WINGET_REQUIRED_FLAGS = ["--accept-source-agreements"]
+WINGET_OPTIONAL_FLAGS = []
+if os.environ.get("WSU_WINGET_OPTIONAL_FLAGS", "0") == "1":
+    WINGET_OPTIONAL_FLAGS = ["--accept-package-agreements", "--disable-interactivity"]
+ENABLE_FILESIZE_SCAN = os.environ.get("WSU_FILESIZE_SCAN", "1") == "1"
+ENABLE_EXECUTABLE_SCAN = os.environ.get("WSU_EXECUTABLE_SCAN", "0") == "1"
+
+ACCENT = "#21D4FD"
+ACCENT_SOFT = "#9BE8FF"
+BG = "#0B0C0F"
+PANEL = "#111216"
+PANEL_BORDER = "#1C1F26"
+TEXT = "#E7EAF0"
+TEXT_MUTED = "#A8B0BF"
+SUCCESS = "#2BD98A"
+WARNING = "#F0C84B"
+ERROR = "#FF5C5C"
+
+# --- Extended surface & interaction tokens ---
+SURFACE = "#0F1116"        # table / input background
+SURFACE_2 = "#12161C"      # alternating rows
+HOVER = "#161C26"          # row hover
+BUTTON_BG = "#161A20"      # ghost / action button fill
+BORDER_SOFT = "#252A36"    # subtle border
+BORDER_MID = "#2A3040"     # scrollbar handle, separator
+BORDER_FOCUS = "#21D4FD"   # focused ring
+WARN_BORDER = "#F0C84B"    # exclude button border
+MUTED_BORDER = "#2A313D"   # skip button border
+TITLE_BG_1 = "#10141B"     # title bar gradient start
+TITLE_BG_2 = "#141A22"     # title bar gradient end
 
 
-class SoftwareUpdater:
-    """A Tkinter GUI for updating Windows software via winget.
+def resolve_data_path(filename: str) -> str:
+    """Resolve a stable data path with backward-compatible fallbacks."""
+    cwd_path = os.path.join(os.getcwd(), filename)
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    for candidate in (cwd_path, local_path):
+        if os.path.exists(candidate):
+            return candidate
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".windows-software-updater")
+    app_dir = os.path.join(base, "WindowsSoftwareUpdater")
+    os.makedirs(app_dir, exist_ok=True)
+    return os.path.join(app_dir, filename)
 
-    This class encapsulates all of the application state and behaviour,
-    including UI construction, background scanning for updates, applying
-    updates, and persisting fake/excluded update metadata.
+
+def load_json(path: str) -> Dict:
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_json(path: str, data: Dict) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4)
+    except IOError as exc:
+        raise IOError(f"Error saving JSON file '{path}': {exc}")
+
+
+@dataclass
+class UpdateItem:
+    name: str
+    package_id: str
+    installed_version: str
+    available_version: str
+    file_size: Optional[float] = None
+    executable_path: Optional[str] = None
+
+
+class WingetClient:
+    @staticmethod
+    def run_command(args: List[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        if timeout is None:
+            timeout = WINGET_TIMEOUT_SECONDS
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            return subprocess.run(
+                args,
+                startupinfo=startupinfo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"winget timed out after {timeout} seconds") from exc
+
+    @staticmethod
+    def run_winget(args: List[str]) -> subprocess.CompletedProcess:
+        full_args = args + WINGET_REQUIRED_FLAGS + WINGET_OPTIONAL_FLAGS
+        result = WingetClient.run_command(full_args)
+        if result.returncode != 0:
+            combined = f"{result.stdout} {result.stderr}".lower()
+            unknown_tokens = (
+                "unknown argument",
+                "unrecognized option",
+                "not recognized",
+                "unknown option",
+                "is not a valid option",
+            )
+            if any(token in combined for token in unknown_tokens):
+                result = WingetClient.run_command(args + WINGET_REQUIRED_FLAGS)
+        return result
+
+    @staticmethod
+    def parse_upgrade_output(output: str) -> List[Tuple[str, str, str, str]]:
+        lines = output.splitlines()
+        start_index = 0
+        for i, line in enumerate(lines):
+            if line.startswith("Name") and "Id" in line:
+                start_index = i + 1
+                break
+        entries: List[Tuple[str, str, str, str]] = []
+        for line in lines[start_index:]:
+            if not line.strip() or line.strip().startswith("-"):
+                continue
+            cleaned = line.replace("winget", "").strip()
+            pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
+            match = re.match(pattern, cleaned)
+            if match:
+                name = match.group(1).strip()
+                package_id = match.group(2).strip()
+                installed_version = match.group(3).strip()
+                available_version = match.group(4).strip()
+                entries.append((name, package_id, installed_version, available_version))
+            else:
+                parts = re.split(r"\s{2,}", cleaned)
+                if len(parts) >= 4:
+                    name = parts[0].strip()
+                    package_id = parts[1].strip()
+                    installed_version = parts[2].strip()
+                    available_version = parts[3].strip()
+                    entries.append((name, package_id, installed_version, available_version))
+        return entries
+
+    @staticmethod
+    def get_file_size(package_id: str) -> Optional[float]:
+        if not ENABLE_FILESIZE_SCAN:
+            return None
+        try:
+            result = WingetClient.run_command(
+                ["winget", "show", package_id],
+                timeout=WINGET_SHOW_TIMEOUT_SECONDS,
+            )
+            match = re.search(
+                r"Installer Url:\s*(https?://[^\s]+)",
+                result.stdout or "",
+                re.IGNORECASE,
+            )
+            if not match:
+                return None
+            link = match.group(1)
+            try:
+                response = requests.head(link, allow_redirects=True, timeout=6)
+                if "Content-Length" not in response.headers:
+                    response = requests.get(link, stream=True, timeout=6)
+                size_bytes = int(response.headers.get("Content-Length", 0))
+                if size_bytes <= 0:
+                    return None
+                return round(size_bytes / (1024 * 1024), 2)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_executable_path(package_id: str, package_name: str) -> Optional[str]:
+        if not ENABLE_EXECUTABLE_SCAN:
+            return None
+        try:
+            result = WingetClient.run_command(
+                ["winget", "show", "--id", package_id, "--exact"],
+                timeout=WINGET_SHOW_TIMEOUT_SECONDS,
+            )
+            output = result.stdout or ""
+            match = re.search(r"Install Location:\s*(.*?)\n", output, re.IGNORECASE)
+            if not match:
+                return None
+            install_path = match.group(1).strip()
+            if not install_path or not os.path.exists(install_path):
+                return None
+            for root_dir, _, files in os.walk(install_path):
+                for file in files:
+                    if file.lower().endswith(".exe") and (
+                        package_name.lower() in file.lower()
+                        or package_id.lower() in file.lower()
+                    ):
+                        return os.path.join(root_dir, file)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def resolve_package_name(package_id: str) -> str:
+        try:
+            search_result = WingetClient.run_command(
+                ["winget", "search", "--id", package_id, "--exact"]
+            )
+            output = search_result.stdout or ""
+            for line in output.splitlines():
+                if package_id in line and not line.strip().startswith(("Name", "--")):
+                    match = re.match(
+                        rf"^(.*?)\s{{2,}}{re.escape(package_id)}(\s|$)", line
+                    )
+                    if match:
+                        candidate = match.group(1).strip()
+                        if candidate:
+                            return candidate
+            show_result = WingetClient.run_command(
+                ["winget", "show", "--id", package_id, "--exact"]
+            )
+            match = re.search(
+                r"^Name:\s*(.+)$",
+                show_result.stdout or "",
+                re.IGNORECASE | re.MULTILINE,
+            )
+            if match:
+                return match.group(1).strip()
+        except Exception:
+            pass
+        return package_id
+
+
+class ScanWorker(QObject):
+    result = pyqtSignal(list, dict, bool)
+    size_ready = pyqtSignal(str, float)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(
+        self,
+        fake_updates: Dict[str, str],
+        excluded_updates: Dict[str, bool],
+        skipped_updates: Dict[str, str],
+    ) -> None:
+        super().__init__()
+        self.fake_updates = dict(fake_updates)
+        self.excluded_updates = dict(excluded_updates)
+        self.skipped_updates = dict(skipped_updates)
+
+    def run(self) -> None:
+        skipped_changed = False
+        updates: List[UpdateItem] = []
+        try:
+            result = WingetClient.run_winget(["winget", "upgrade"])
+            entries = WingetClient.parse_upgrade_output(result.stdout or "")
+            for name, package_id, installed_version, available_version in entries:
+                if (
+                    package_id in self.fake_updates
+                    and self.fake_updates[package_id] == available_version
+                ) or (package_id in self.excluded_updates):
+                    continue
+                skip_version = self.skipped_updates.get(package_id)
+                if skip_version == available_version:
+                    continue
+                if skip_version is not None and skip_version != available_version:
+                    self.skipped_updates.pop(package_id, None)
+                    skipped_changed = True
+                updates.append(
+                    UpdateItem(
+                        name=name,
+                        package_id=package_id,
+                        installed_version=installed_version,
+                        available_version=available_version,
+                        file_size=None,
+                        executable_path=None,
+                    )
+                )
+            # Phase 1: emit the parsed list immediately so the UI is responsive.
+            # The slow per-package metadata lookups must not block "checking".
+            self.result.emit(updates, self.skipped_updates, skipped_changed)
+            # Phase 2: fetch download sizes in the background and stream them in.
+            if ENABLE_FILESIZE_SCAN:
+                for item in updates:
+                    size = WingetClient.get_file_size(item.package_id)
+                    if size is not None:
+                        self.size_ready.emit(item.package_id, size)
+        except FileNotFoundError:
+            self.error.emit("winget not found. Please install Windows Package Manager.")
+        except TimeoutError as exc:
+            self.error.emit(str(exc))
+        except subprocess.CalledProcessError as exc:
+            self.error.emit(f"Error checking for updates: {exc.stderr}")
+        finally:
+            self.finished.emit()
+
+
+class UpdateWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    package_progress = pyqtSignal(str, int)  # package_id, percent (0-100)
+    item_complete = pyqtSignal(str, bool, bool, str)
+    error = pyqtSignal(str)
+    finished = pyqtSignal(bool)
+
+    _PCT_RE = re.compile(r"(\d{1,3})\s*%")
+    _UNKNOWN_TOKENS = (
+        "unknown argument",
+        "unrecognized option",
+        "not recognized",
+        "unknown option",
+        "is not a valid option",
+    )
+
+    def __init__(self, package_ids: List[str], updates_by_id: Dict[str, UpdateItem]) -> None:
+        super().__init__()
+        self.package_ids = list(package_ids)
+        self.updates_by_id = dict(updates_by_id)
+
+    def _stream(self, args: List[str], package_id: str) -> Tuple[int, str]:
+        """Run winget while streaming stdout so download/install percent can be
+        emitted live. Returns (returncode, combined_output_lowercased)."""
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        proc = subprocess.Popen(
+            args,
+            startupinfo=startupinfo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        collected: List[str] = []
+        token = ""
+        last_pct = -1
+        assert proc.stdout is not None
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            # winget repaints progress on the same line using carriage returns.
+            if ch in ("\r", "\n"):
+                if token.strip():
+                    collected.append(token)
+                    match = self._PCT_RE.search(token)
+                    if match:
+                        pct = max(0, min(100, int(match.group(1))))
+                        if pct != last_pct:
+                            last_pct = pct
+                            self.package_progress.emit(package_id, pct)
+                token = ""
+            else:
+                token += ch
+        if token.strip():
+            collected.append(token)
+        proc.wait()
+        return proc.returncode, " ".join(collected).lower()
+
+    def run(self) -> None:
+        total = len(self.package_ids)
+        try:
+            for index, package_id in enumerate(self.package_ids, start=1):
+                self.package_progress.emit(package_id, 0)
+                base = ["winget", "upgrade", package_id]
+                returncode, combined = self._stream(
+                    base + WINGET_REQUIRED_FLAGS + WINGET_OPTIONAL_FLAGS, package_id
+                )
+                if returncode != 0 and any(t in combined for t in self._UNKNOWN_TOKENS):
+                    # Optional flags rejected by this winget version; retry plainly.
+                    returncode, combined = self._stream(
+                        base + WINGET_REQUIRED_FLAGS, package_id
+                    )
+                if returncode == 0 or "successfully upgraded" in combined:
+                    self.package_progress.emit(package_id, 100)
+                    self.item_complete.emit(package_id, True, False, "")
+                else:
+                    if "no package found" in combined or "not installed" in combined:
+                        self.item_complete.emit(package_id, False, True, "")
+                    else:
+                        message = combined.strip() or "Unknown error occurred"
+                        self.error.emit(f"Error updating {package_id}: {message}")
+                        self.finished.emit(False)
+                        return
+                self.progress.emit(index, total, package_id)
+            self.finished.emit(True)
+        except FileNotFoundError:
+            self.error.emit("winget not found. Please install Windows Package Manager.")
+            self.finished.emit(False)
+        except TimeoutError as exc:
+            self.error.emit(str(exc))
+            self.finished.emit(False)
+        except Exception as exc:
+            self.error.emit(f"Unexpected error: {exc}")
+            self.finished.emit(False)
+
+
+class ExclusionsWorker(QObject):
+    result = pyqtSignal(list)
+    finished = pyqtSignal()
+
+    def __init__(self, excluded_ids: List[str]) -> None:
+        super().__init__()
+        self.excluded_ids = list(excluded_ids)
+
+    def run(self) -> None:
+        entries: List[Tuple[str, str]] = []
+        for pid in self.excluded_ids:
+            name = WingetClient.resolve_package_name(pid)
+            entries.append((pid, name))
+        self.result.emit(entries)
+        self.finished.emit()
+
+
+class WindowControlButton(QToolButton):
+    """A circular window-control button painted entirely with QPainter.
+
+    symbol        – one of 'min', 'max', 'close'
+    color_normal  – idle circle fill (None = transparent until hover)
+    color_hover   – circle fill on hover
     """
 
-    #: JSON file used to record fake updates (where winget reports an
-    #: available version for a package that cannot actually be updated).
-    FAKE_UPDATES_FILE = "fake_updates.json"
-    #: JSON file used to record permanently excluded packages.  Excluded
-    #: packages will not show up in the update list on subsequent scans.
-    EXCLUDED_UPDATES_FILE = "excluded_updates.json"
-    #: JSON file used to record versions the user chooses to skip once.
-    #: These entries are cleared automatically when a newer version is detected.
-    SKIPPED_UPDATES_FILE = "skipped_updates.json"
+    def __init__(
+        self,
+        symbol: str,
+        color_normal: Optional[str],
+        color_hover: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._symbol = symbol
+        self._color_normal = QColor(color_normal) if color_normal else None
+        self._color_hover = QColor(color_hover)
+        self._hovered = False
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("WindowControlButton")
+        self.setIcon(QIcon())
 
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Windows Software Updater")
-        # Fix the window size but allow resizing downwards if the user
-        # collapses the tree.  A minimum width of 1000px provides room
-        # for the extra columns that were added for selection/exclusion.
-        self.root.geometry("1200x600")
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
 
-        # Header bar with app title, subtitle, and primary actions
-        header_bg = "#0d6efd"
-        header_fg = "#ffffff"
-        sub_fg = "#eaf2ff"
-        self.header = tk.Frame(root, bg=header_bg)
-        self.header.pack(fill=tk.X)
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
 
-        icon_canvas = tk.Canvas(self.header, width=28, height=28, bg=header_bg, highlightthickness=0)
-        icon_canvas.grid(row=0, column=0, padx=(12, 8), pady=10)
-        icon_canvas.create_oval(2, 2, 26, 26, fill="#ffffff", outline="")
-        icon_canvas.create_rectangle(8, 9, 20, 12, fill=header_bg, outline="")
-        icon_canvas.create_rectangle(8, 14, 20, 17, fill=header_bg, outline="")
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 4
 
-        title_block = tk.Frame(self.header, bg=header_bg)
-        title_block.grid(row=0, column=1, sticky="w")
-        tk.Label(
-            title_block,
-            text="Windows Software Updater",
-            font=("Segoe UI", 16, "bold"),
-            fg=header_fg,
-            bg=header_bg,
-        ).pack(anchor="w")
-        tk.Label(
-            title_block,
-            text="Powered by Windows Package Manager (winget)",
-            font=("Segoe UI", 10),
-            fg=sub_fg,
-            bg=header_bg,
-        ).pack(anchor="w")
+        # Circle fill: subtle at idle, brighter on hover.
+        if self._hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._color_hover)
+            painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
+        elif self._color_normal:
+            idle_fill = QColor(self._color_normal)
+            idle_fill.setAlphaF(0.35)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(idle_fill)
+            painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
 
-        self.toolbar = ttk.Frame(self.header)
-        self.toolbar.grid(row=0, column=2, sticky="e", padx=12)
-        self.header.grid_columnconfigure(1, weight=1)
+        # Symbol is always drawn so each control is recognisable at idle.
+        if self._hovered:
+            symbol_color = QColor("#0B0C0F")
+        elif self._symbol == "close":
+            symbol_color = QColor("#FF9C96")
+        else:
+            symbol_color = QColor(TEXT)
+        pen = QPen(symbol_color)
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        m = int(r * 0.42)
+        x0, y0 = int(cx) - m, int(cy) - m
+        x1, y1 = int(cx) + m, int(cy) + m
+        if self._symbol == "close":
+            painter.drawLine(x0, y0, x1, y1)
+            painter.drawLine(x1, y0, x0, y1)
+        elif self._symbol == "min":
+            painter.drawLine(x0, int(cy), x1, int(cy))
+        elif self._symbol in ("max", "restore"):
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(x0, y0, m * 2, m * 2)
+        painter.end()
 
-        self.check_button = ttk.Button(
-            self.toolbar,
-            text="Check for Updates",
-            command=self.check_for_updates,
-        )
-        self.check_button.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.update_all_button = ttk.Button(
-            self.toolbar,
-            text="Update All",
-            state=tk.DISABLED,
-            command=self.update_all,
-        )
-        self.update_all_button.pack(side=tk.LEFT, padx=(0, 8))
+class SearchBar(QWidget):
+    """A QLineEdit wrapped in a custom widget that paints a magnifier icon
+    on the left and shows a clear (X) button when text is present.
 
-        self.update_selected_button = ttk.Button(
-            self.toolbar,
-            text="Update Selected",
-            state=tk.DISABLED,
-            command=self.update_selected,
-        )
-        self.update_selected_button.pack(side=tk.LEFT)
+    Connect signals via the exposed ``line_edit`` attribute.
+    """
 
-        # Button to manage permanently excluded packages
-        self.manage_exclusions_button = ttk.Button(
-            self.toolbar,
-            text="Manage Exclusions",
-            command=self.show_exclusions_view,
-        )
-        self.manage_exclusions_button.pack(side=tk.LEFT, padx=(8, 0))
+    def __init__(self, placeholder: str = "Search...", parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("SearchBar")
+        self.setFixedHeight(38)
 
-        # Back button (visible only in exclusions view)
-        self.back_button = ttk.Button(
-            self.toolbar, text="Back", command=self.show_updates_view
-        )
-        # Hide initially; shown when managing exclusions
-        # Use pack_forget to toggle visibility cleanly
-        self.back_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.back_button.pack_forget()
-
-        ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X)
-
-        # Configure styles for a more modern look and feel.  Increase
-        # row height in the treeview for better readability and adjust
-        # fonts globally via ttk.Style.  Note that ttk widgets share
-        # style names; adjusting the treeview will not affect labels.
-        self.style = ttk.Style()
-        try:
-            if "vista" in self.style.theme_names():
-                self.style.theme_use("vista")
-            else:
-                self.style.theme_use("clam")
-        except Exception:
-            self.style.theme_use("default")
-        self.style.configure(
-            "TButton", padding=6, relief="flat", font=("Helvetica", 10)
-        )
-        self.style.configure(
-            "Title.TLabel", font=("Helvetica", 16, "bold")
-        )
-        self.style.configure(
-            "Subtitle.TLabel", font=("Helvetica", 12)
-        )
-        # Make tree headings bold and slightly larger
-        self.style.configure(
-            "Treeview.Heading", font=("Helvetica", 10, "bold"), anchor="center"
-        )
-        # Increase the default row height of the treeview for spacing
-        self.style.configure(
-            "Treeview", font=("Helvetica", 10), rowheight=24
-        )
-        self.style.configure(
-            "Dialog.TLabel", font=("Helvetica", 12, "bold"), foreground="red"
+        self.line_edit = QLineEdit(self)
+        self.line_edit.setPlaceholderText(placeholder)
+        self.line_edit.setObjectName("SearchInput")
+        self.line_edit.setStyleSheet(
+            "QLineEdit#SearchInput { background: transparent; border: none;"
+            " color: #E7EAF0; padding: 0px; }"
         )
 
-        # Create the main frame.  All widgets except the top‑level title
-        # are children of this frame, which simplifies layout.
-        self.main_frame = ttk.Frame(root, padding="10")
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Header moved to top bar; legacy title/buttons removed
-
-        # Status label to communicate the current state to the user
-        self.status_label = ttk.Label(
-            self.main_frame,
-            text="Click 'Check for Updates' to begin",
-            style="Subtitle.TLabel",
+        self._clear_btn = QToolButton(self)
+        self._clear_btn.setText("✕")
+        self._clear_btn.setObjectName("SearchClearButton")
+        self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_btn.setFixedSize(20, 20)
+        self._clear_btn.setVisible(False)
+        self._clear_btn.clicked.connect(self.line_edit.clear)
+        self.line_edit.textChanged.connect(
+            lambda t: self._clear_btn.setVisible(bool(t))
         )
-        self.status_label.grid(row=0, column=0, columnspan=3, pady=5, sticky=tk.W)
 
-        # Progress bar.  We leave it empty until a scan or update begins.
-        self.progress = ttk.Progressbar(
-            self.main_frame,
-            orient=tk.HORIZONTAL,
-            length=100,
-            mode="determinate",
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(38, 0, 8, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self.line_edit, 1)
+        layout.addWidget(self._clear_btn)
+
+        self._focused = False
+        self.line_edit.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        from PyQt6.QtCore import QEvent
+
+        if obj is self.line_edit:
+            if event.type() == QEvent.Type.FocusIn:
+                self._focused = True
+                self.update()
+            elif event.type() == QEvent.Type.FocusOut:
+                self._focused = False
+                self.update()
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        radius = 10
+
+        border_color = QColor(BORDER_FOCUS if self._focused else BORDER_SOFT)
+        painter.setPen(QPen(border_color, 1))
+        painter.setBrush(QColor(SURFACE))
+        painter.drawRoundedRect(0, 0, w - 1, h - 1, radius, radius)
+
+        icon_cx, icon_cy = 18, h // 2
+        icon_r = 6
+        pen = QPen(QColor(TEXT_MUTED))
+        pen.setWidthF(1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(icon_cx - icon_r, icon_cy - icon_r, icon_r * 2, icon_r * 2)
+        off = int(icon_r * 0.707)
+        painter.drawLine(
+            icon_cx + off, icon_cy + off, icon_cx + off + 4, icon_cy + off + 4
         )
-        self.progress.grid(row=1, column=0, columnspan=3, pady=10, sticky=tk.EW)
-        # Stretch progress bar across the available width
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_columnconfigure(1, weight=1)
-        self.main_frame.grid_columnconfigure(2, weight=1)
+        painter.end()
 
-        # Frame for the treeview and its scrollbar.  Making this a
-        # separate frame allows the scrollbar to sit flush to the
-        # right-hand side of the table.
-        self.tree_frame = ttk.Frame(self.main_frame)
-        self.tree_frame.grid(row=2, column=0, columnspan=3, sticky=tk.NSEW)
-        self.main_frame.grid_rowconfigure(2, weight=1)
+    def text(self) -> str:
+        return self.line_edit.text()
 
-        # Create the vertical scrollbar
-        self.tree_scroll = ttk.Scrollbar(self.tree_frame)
-        self.tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Create the treeview itself.  It now includes an extra
-        # "exclude" column for permanently hiding certain software.
-        self.tree = ttk.Treeview(
-            self.tree_frame,
-            columns=(
-                "name",
-                "current_version",
-                "new_version",
-                "file_size",
-                "update",
-                "exclude",
-                "skip",
-            ),
-            show="headings",
-            yscrollcommand=self.tree_scroll.set,
-            selectmode="extended",
+class VersionBadge(QWidget):
+    """A rounded pill badge showing a version string.
+
+    variant='installed'  -> muted grey pill
+    variant='available'  -> cyan pill
+    """
+
+    def __init__(self, text: str, variant: str = "installed", parent=None) -> None:
+        super().__init__(parent)
+        self._text = text
+        self._variant = variant
+        self.setFont(QFont("Bahnschrift", 8))
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
+        self.setFixedHeight(22)
+
+    def sizeHint(self):
+        from PyQt6.QtCore import QSize
+        from PyQt6.QtGui import QFontMetrics
+
+        fm = QFontMetrics(self.font())
+        width = fm.horizontalAdvance(self._text) + 22
+        return QSize(max(width, 52), 22)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        radius = self.height() / 2
+        rect = self.rect().adjusted(0, 1, -1, -2)
+
+        if self._variant == "available":
+            bg = QColor(ACCENT)
+            bg.setAlphaF(0.15)
+            border = QColor(ACCENT)
+            text_color = QColor(ACCENT_SOFT)
+        else:
+            bg = QColor(BORDER_MID)
+            bg.setAlphaF(0.5)
+            border = QColor(BORDER_SOFT)
+            text_color = QColor(TEXT_MUTED)
+
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        painter.setPen(text_color)
+        painter.setFont(self.font())
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._text)
+        painter.end()
+
+
+class EmptyStateWidget(QWidget):
+    """Shown in place of the table when there is nothing to display.
+
+    States: 'idle' | 'scanning' | 'up_to_date'
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._state = "idle"
+        self._angle = 0.0
+
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(16)
+        self._spin_timer.timeout.connect(self._advance_spinner)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(14)
+
+        self._icon_canvas = QWidget()
+        self._icon_canvas.setFixedSize(72, 72)
+        self._icon_canvas.paintEvent = self._paint_icon
+        layout.addWidget(self._icon_canvas, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self._title_lbl = QLabel("Scan to check for updates")
+        self._title_lbl.setObjectName("EmptyStateTitle")
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._title_lbl)
+
+        self._sub_lbl = QLabel("Click 'Check for Updates' to begin")
+        self._sub_lbl.setObjectName("EmptyStateSub")
+        self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._sub_lbl)
+
+    def set_state(self, state: str) -> None:
+        self._state = state
+        if state == "idle":
+            self._spin_timer.stop()
+            self._title_lbl.setText("Scan to check for updates")
+            self._sub_lbl.setText("Click 'Check for Updates' to begin")
+        elif state == "scanning":
+            self._angle = 0.0
+            self._spin_timer.start()
+            self._title_lbl.setText("Scanning for updates…")
+            self._sub_lbl.setText("This may take a moment")
+        elif state == "up_to_date":
+            self._spin_timer.stop()
+            self._title_lbl.setText("All software is up to date")
+            self._sub_lbl.setText("No updates were found")
+        self._icon_canvas.update()
+
+    def _advance_spinner(self) -> None:
+        self._angle = (self._angle + 4.0) % 360.0
+        self._icon_canvas.update()
+
+    def _paint_icon(self, event) -> None:
+        w = self._icon_canvas.width()
+        h = self._icon_canvas.height()
+        painter = QPainter(self._icon_canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy = w / 2, h / 2
+
+        if self._state == "scanning":
+            track_pen = QPen(QColor(BORDER_MID), 4)
+            painter.setPen(track_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(int(cx - 28), int(cy - 28), 56, 56, 0, 360 * 16)
+            pen = QPen(QColor(ACCENT), 4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(
+                int(cx - 28), int(cy - 28), 56, 56, int(-self._angle * 16), 270 * 16
+            )
+        elif self._state == "up_to_date":
+            pen = QPen(QColor(SUCCESS), 3)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(int(cx - 28), int(cy - 28), 56, 56)
+            path = QPainterPath()
+            path.moveTo(cx - 12, cy)
+            path.lineTo(cx - 4, cy + 10)
+            path.lineTo(cx + 14, cy - 10)
+            painter.drawPath(path)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            bg = QColor(BORDER_MID)
+            bg.setAlphaF(0.4)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(int(cx - 28), int(cy - 28), 56, 56, 14, 14)
+            pen = QPen(QColor(TEXT_MUTED), 2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            arrow = QPainterPath()
+            arrow.moveTo(cx, cy + 14)
+            arrow.lineTo(cx, cy - 14)
+            arrow.moveTo(cx, cy - 14)
+            arrow.lineTo(cx + 10, cy - 4)
+            arrow.moveTo(cx, cy - 14)
+            arrow.lineTo(cx - 10, cy - 4)
+            painter.drawPath(arrow)
+        painter.end()
+
+
+class StatusChip(QWidget):
+    """Footer status indicator: a colored dot plus a text label.
+
+    States map to dot colors; 'scanning' pulses via an opacity animation.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._state = "idle"
+        self._dot_opacity = 1.0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
+
+        self._dot_canvas = QWidget()
+        self._dot_canvas.setFixedSize(10, 10)
+        self._dot_canvas.paintEvent = self._paint_dot
+        layout.addWidget(self._dot_canvas, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._label = QLabel("Idle")
+        self._label.setObjectName("FooterText")
+        layout.addWidget(self._label)
+
+        self._anim = QPropertyAnimation(self, b"dot_opacity")
+        self._anim.setDuration(1000)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.2)
+        self._anim.setEasingCurve(QEasingCurve.Type.SineCurve)
+        self._anim.setLoopCount(-1)
+
+    @pyqtProperty(float)
+    def dot_opacity(self) -> float:
+        return self._dot_opacity
+
+    @dot_opacity.setter
+    def dot_opacity(self, value: float) -> None:
+        self._dot_opacity = value
+        self._dot_canvas.update()
+
+    def set_state(self, state: str, text: str) -> None:
+        self._state = state
+        self._label.setText(text)
+        if state == "scanning":
+            self._anim.start()
+        else:
+            self._anim.stop()
+            self._dot_opacity = 1.0
+        self._dot_canvas.update()
+
+    def _paint_dot(self, event) -> None:
+        color_map = {
+            "idle": TEXT_MUTED,
+            "scanning": ACCENT,
+            "updating": WARNING,
+            "done": SUCCESS,
+            "error": ERROR,
+        }
+        c = QColor(color_map.get(self._state, TEXT_MUTED))
+        c.setAlphaF(self._dot_opacity)
+        painter = QPainter(self._dot_canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(c)
+        painter.drawEllipse(0, 0, 9, 9)
+        painter.end()
+
+
+class _FooterProxy:
+    """Thin shim so legacy ``self.footer_status.setText(...)`` calls route to a
+    StatusChip without changing any call site."""
+
+    def __init__(self, chip: "StatusChip") -> None:
+        self._chip = chip
+
+    def setText(self, text: str) -> None:
+        lowered = text.lower()
+        if text == "Idle":
+            state = "idle"
+        elif "scan" in lowered:
+            state = "scanning"
+        elif "updating" in lowered:
+            state = "updating"
+        elif "updated" in lowered:
+            state = "done"
+        else:
+            state = "idle"
+        self._chip.set_state(state, text)
+
+
+class TitleBar(QFrame):
+    def __init__(self, parent: "MainWindow") -> None:
+        super().__init__(parent)
+        self.setObjectName("TitleBar")
+        self.setFixedHeight(50)
+        self._drag_pos: Optional[QPoint] = None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 5, 12, 5)
+        layout.setSpacing(12)
+
+        logo_label = QLabel()
+        logo_label.setPixmap(build_logo_pixmap(26))
+        logo_label.setFixedSize(28, 28)
+
+        title_block = QVBoxLayout()
+        title_block.setContentsMargins(0, 0, 0, 0)
+        title_block.setSpacing(2)
+        title = QLabel(APP_TITLE)
+        title.setObjectName("TitleText")
+        subtitle = QLabel(APP_SUBTITLE)
+        subtitle.setObjectName("SubtitleText")
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+
+        title_wrap = QHBoxLayout()
+        title_wrap.setContentsMargins(0, 0, 0, 0)
+        title_wrap.setSpacing(10)
+        title_wrap.addWidget(logo_label)
+        title_wrap.addLayout(title_block)
+
+        left = QWidget()
+        left.setLayout(title_wrap)
+
+        layout.addWidget(left)
+        layout.addStretch(1)
+
+        self.min_button = WindowControlButton(
+            symbol="min", color_normal="#2A3040", color_hover="#5A6070"
         )
-        self.tree.heading("name", text="Software Name")
-        self.tree.heading("current_version", text="Current Version")
-        self.tree.heading("new_version", text="Available Version")
-        self.tree.heading("file_size", text="New Version Size")
-        self.tree.heading("update", text="Action")
-        self.tree.heading("exclude", text="Exclude")
-        self.tree.heading("skip", text="Skip Version")
-        # Column widths tuned to fit the new table.  The exclude
-        # columns are narrow as they only contain link-style actions.
-        self.tree.column("name", width=350, anchor="w")
-        self.tree.column("current_version", width=150, anchor="center")
-        self.tree.column("new_version", width=150, anchor="center")
-        self.tree.column("file_size", width=120, anchor="center")
-        self.tree.column("update", width=100, anchor="center")
-        self.tree.column("exclude", width=100, anchor="center")
-        self.tree.column("skip", width=110, anchor="center")
-        self.tree.pack(fill=tk.BOTH, expand=True)
-        self.tree_scroll.config(command=self.tree.yview)
+        self.max_button = WindowControlButton(
+            symbol="max", color_normal="#2A3040", color_hover="#5A6070"
+        )
+        self.close_button = WindowControlButton(
+            symbol="close", color_normal="#2A3040", color_hover="#E0443A"
+        )
 
-        # Bind a click handler on the treeview so we can interpret
-        # clicks on the update and exclude columns.  Selecting rows for
-        # batch updates is handled automatically by the ttk.Treeview.
-        self.tree.bind("<Button-1>", self._handle_tree_click)
+        layout.addWidget(self.min_button)
+        layout.addWidget(self.max_button)
+        layout.addWidget(self.close_button)
 
-        # Track when the tree selection changes so we can enable or
-        # disable the 'Update Selected' button.  Without this the
-        # button would remain enabled after all rows have been removed.
-        self.tree.bind("<<TreeviewSelect>>", self._handle_selection_change)
+        self.min_button.clicked.connect(parent.showMinimized)
+        self.max_button.clicked.connect(parent.toggle_maximize)
+        self.close_button.clicked.connect(parent.close)
 
-        # Initialize state.  'updates' holds the list of dictionaries
-        # describing available updates.  'update_in_progress' is used
-        # to prevent simultaneous update operations.  The fake and
-        # excluded updates are persisted across runs.
-        self.updates: List[Dict[str, Optional[str]]] = []
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+        gradient = QLinearGradient(0, 0, w, 0)
+        gradient.setColorAt(0.0, QColor(ACCENT))
+        gradient.setColorAt(0.6, QColor(ACCENT))
+        gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+        pen = QPen()
+        pen.setBrush(gradient)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.drawLine(0, h - 1, w, h - 1)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_pos = None
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window().toggle_maximize()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(1100, 680)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        self.fake_updates_path = resolve_data_path("fake_updates.json")
+        self.excluded_updates_path = resolve_data_path("excluded_updates.json")
+        self.skipped_updates_path = resolve_data_path("skipped_updates.json")
+
+        self.fake_updates: Dict[str, str] = load_json(self.fake_updates_path)
+        self.excluded_updates: Dict[str, bool] = load_json(self.excluded_updates_path)
+        self.skipped_updates: Dict[str, str] = load_json(self.skipped_updates_path)
+
         self.update_in_progress = False
-        self.fake_updates: Dict[str, str] = self._load_json(self.FAKE_UPDATES_FILE)
-        self.excluded_updates: Dict[str, bool] = self._load_json(self.EXCLUDED_UPDATES_FILE)
-        self.skipped_updates: Dict[str, str] = self._load_json(self.SKIPPED_UPDATES_FILE)
+        self.updates: List[UpdateItem] = []
+        self.updates_by_id: Dict[str, UpdateItem] = {}
+        self._current_thread: Optional[QThread] = None
+        self.scan_in_progress = False
+        self._scan_watchdog = QTimer(self)
+        self._scan_watchdog.setSingleShot(True)
+        self._scan_watchdog.timeout.connect(self._handle_scan_timeout)
 
-        # Load icon path (packaged with PyInstaller if necessary)
-        self.base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        self.icon_path = os.path.join(self.base_path, "icon.ico")
+        self._build_ui()
+        self._setup_tray()
+        self._show_empty_state("idle")
 
-        # Create a toast notifier for update completion if win10toast_click is available.
-        # This will be used to show a notification whenever a package finishes
-        # updating successfully. If the import failed (e.g., on non-Windows
-        # platforms or when the module is missing) this attribute will be None
-        # and completion notifications will be suppressed gracefully.
-        self.completion_notifier = None
-        if WinToastNotifier is not None:
-            try:
-                self.completion_notifier = WinToastNotifier()
-                self._harden_notifier_callbacks()
-            except Exception:
-                self.completion_notifier = None
+        QTimer.singleShot(300, self.check_for_updates)
 
-        # Automatically check for updates when the application starts
-        # to improve UX.
-        self.check_for_updates()
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
 
-    # ------------------------------------------------------------------
-    # Persistent storage helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _load_json(filename: str) -> Dict:
-        """Load a JSON file from disk and return an empty dict on error.
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(10, 8, 10, 10)
+        root_layout.setSpacing(8)
 
-        All persistent metadata files (fake updates and excluded updates)
-        share the same loading semantics.  When the file cannot be
-        parsed or does not exist, an empty dict is returned.
-        """
-        if os.path.exists(filename):
-            try:
-                with open(filename, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                return {}
-        return {}
+        self.title_bar = TitleBar(self)
+        root_layout.addWidget(self.title_bar)
 
-    @staticmethod
-    def _save_json(filename: str, data: Dict) -> None:
-        """Persist a dictionary to disk as JSON, handling IO errors.
+        self.shell = QFrame()
+        self.shell.setObjectName("Shell")
+        shell_layout = QVBoxLayout(self.shell)
+        shell_layout.setContentsMargins(18, 14, 18, 16)
+        shell_layout.setSpacing(12)
+        root_layout.addWidget(self.shell, 1)
 
-        In the unlikely event of an error during save, the user is
-        presented with a message box in the caller.
-        """
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-        except IOError as e:
-            raise IOError(f"Error saving JSON file '{filename}': {e}")
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(12)
 
-    def _persist_skipped_updates(self) -> None:
-        """Persist the skip-once selections, showing an error if the write fails."""
-        try:
-            self._save_json(self.SKIPPED_UPDATES_FILE, self.skipped_updates)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        info_block = QVBoxLayout()
+        info_block.setContentsMargins(0, 0, 0, 0)
+        info_block.setSpacing(6)
 
-    # ------------------------------------------------------------------
-    # Notification helper
-    # ------------------------------------------------------------------
-    def show_notification(self, updatable_count: int) -> None:
-        """Display a desktop notification about pending updates.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+        self.section_title = QLabel("Update Center")
+        self.section_title.setObjectName("SectionTitle")
+        self.badge_label = QLabel("0")
+        self.badge_label.setObjectName("UpdateBadge")
+        self.badge_label.setVisible(False)
+        title_row.addWidget(self.section_title)
+        title_row.addWidget(self.badge_label)
+        title_row.addStretch(1)
 
-        Uses ``plyer`` to show a simple toast alert indicating how
-        many packages can be updated.  On platforms where plyer
-        notifications are not supported this function will quietly do
-        nothing.
-        """
-        try:
-            notification.notify(
-                title="New Version Available!",
-                message=f"{updatable_count} Update{'s' if updatable_count != 1 else ''} Available",
-                app_name="Software Updater",
-                timeout=5,
+        self.status_label = QLabel("Ready to scan for updates")
+        self.status_label.setObjectName("StatusText")
+        info_block.addLayout(title_row)
+        info_block.addWidget(self.status_label)
+        header_layout.addLayout(info_block)
+        header_layout.addStretch(1)
+
+        self.check_button = self._make_button("Check for Updates", True)
+        self.update_all_button = self._make_button("Update All", False)
+        self.update_selected_button = self._make_button("Update Selected", False)
+        self.manage_exclusions_button = self._make_button("Manage Exclusions", False)
+
+        for btn in (
+            self.check_button,
+            self.update_all_button,
+            self.update_selected_button,
+            self.manage_exclusions_button,
+        ):
+            header_layout.addWidget(btn)
+
+        self.check_button.clicked.connect(self.check_for_updates)
+        self.update_all_button.clicked.connect(self.update_all)
+        self.update_selected_button.clicked.connect(self.update_selected)
+        self.manage_exclusions_button.clicked.connect(self.toggle_exclusions_view)
+
+        self.check_button.setToolTip("Scan for available software updates via winget")
+        self.update_all_button.setToolTip("Update all packages in the list")
+        self.update_selected_button.setToolTip("Update only the selected rows")
+        self.manage_exclusions_button.setToolTip(
+            "View and manage permanently excluded packages"
+        )
+
+        shell_layout.addWidget(header)
+
+        header_divider = QFrame()
+        header_divider.setObjectName("HeaderDivider")
+        header_divider.setFrameShape(QFrame.Shape.HLine)
+        header_divider.setFixedHeight(1)
+        shell_layout.addWidget(header_divider)
+
+        search_row = QWidget()
+        search_layout = QHBoxLayout(search_row)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(12)
+        self._search_bar = SearchBar("Search app name or package id")
+        self.search_input = self._search_bar.line_edit
+        self.search_input.textChanged.connect(self.apply_filter)
+        search_layout.addWidget(self._search_bar, 1)
+        self.result_counter = QLabel("0 updates")
+        self.result_counter.setObjectName("CounterText")
+        search_layout.addWidget(self.result_counter)
+        shell_layout.addWidget(search_row)
+
+        self.stack = QStackedWidget()
+        shell_layout.addWidget(self.stack, 1)
+
+        self.updates_view = QWidget()
+        updates_layout = QVBoxLayout(self.updates_view)
+        updates_layout.setContentsMargins(0, 0, 0, 0)
+        updates_layout.setSpacing(10)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Software",
+                "Installed",
+                "Available",
+                "Size",
+                "Update",
+                "Exclude",
+                "Skip",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        for action_col in (4, 5, 6):
+            self.table.horizontalHeader().setSectionResizeMode(
+                action_col, QHeaderView.ResizeMode.Fixed
             )
-        except Exception:
-            # plyer may throw on unsupported platforms; ignore silently
-            pass
+            self.table.setColumnWidth(action_col, 92)
+        self.table.itemSelectionChanged.connect(self.update_selected_state)
+        updates_layout.addWidget(self.table)
+        self.stack.addWidget(self.updates_view)
 
-    def _harden_notifier_callbacks(self) -> None:
-        """Ensure win10toast_click callbacks return proper values and swallow errors."""
-        if not self.completion_notifier:
+        self.empty_state = EmptyStateWidget()
+        self.stack.addWidget(self.empty_state)
+
+        self.exclusions_view = QWidget()
+        exclusions_layout = QVBoxLayout(self.exclusions_view)
+        exclusions_layout.setContentsMargins(0, 0, 0, 0)
+        exclusions_layout.setSpacing(12)
+        self.exclusions_hint = QLabel(
+            "Excluded apps are hidden from the updates list. Click Unexclude to restore them."
+        )
+        self.exclusions_hint.setObjectName("HintText")
+        exclusions_layout.addWidget(self.exclusions_hint)
+        self.exclusions_table = QTableWidget(0, 2)
+        self.exclusions_table.setHorizontalHeaderLabels(["Software", "Action"])
+        self.exclusions_table.verticalHeader().setVisible(False)
+        self.exclusions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.exclusions_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.exclusions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.exclusions_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.exclusions_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        exclusions_layout.addWidget(self.exclusions_table)
+        self.stack.addWidget(self.exclusions_view)
+
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(12)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        footer_layout.addWidget(self.progress, 1)
+        self.footer_status_chip = StatusChip()
+        footer_layout.addWidget(self.footer_status_chip)
+        self.footer_status = _FooterProxy(self.footer_status_chip)
+        self.size_grip = QSizeGrip(self)
+        footer_layout.addWidget(self.size_grip)
+        shell_layout.addWidget(footer)
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = None
             return
-        try:
-            import win10toast_click as toast_mod  # type: ignore
-        except Exception:
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QIcon(build_logo_pixmap(32))
+        self.tray = QSystemTrayIcon(icon, self)
+        menu = QMenu()
+        open_action = QAction("Open", self)
+        open_action.triggered.connect(self.show_normal)
+        check_action = QAction("Check for Updates", self)
+        check_action.triggered.connect(self.check_for_updates)
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        menu.addAction(open_action)
+        menu.addAction(check_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._handle_tray_activate)
+        self.tray.show()
+
+    def _handle_tray_activate(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_normal()
+
+    def show_normal(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _make_button(self, text: str, primary: bool) -> QToolButton:
+        btn = QToolButton()
+        btn.setText(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setObjectName("PrimaryButton" if primary else "GhostButton")
+        return btn
+
+    def _show_empty_state(self, state: str) -> None:
+        self.empty_state.set_state(state)
+        self.stack.setCurrentWidget(self.empty_state)
+
+    def _show_updates_view(self) -> None:
+        self.stack.setCurrentWidget(self.updates_view)
+
+    def _update_badge(self) -> None:
+        count = len(self.updates)
+        self.badge_label.setText(str(count))
+        self.badge_label.setVisible(count > 0)
+
+    def apply_filter(self) -> None:
+        query = self.search_input.text().strip().lower()
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, 0)
+            package_id = name_item.data(Qt.ItemDataRole.UserRole) if name_item else ""
+            name = name_item.text().lower() if name_item else ""
+            match = query in name or (package_id and query in package_id.lower())
+            self.table.setRowHidden(row, not match)
+
+    def update_selected_state(self) -> None:
+        if self.update_in_progress:
+            self.update_selected_button.setEnabled(False)
             return
+        selected = bool(self.table.selectionModel().selectedRows())
+        self.update_selected_button.setEnabled(selected and bool(self.updates))
 
-        notifier = self.completion_notifier
+    def toggle_exclusions_view(self) -> None:
+        if self.stack.currentWidget() == self.updates_view:
+            self.stack.setCurrentWidget(self.exclusions_view)
+            self.manage_exclusions_button.setText("Back to Updates")
+            self.load_exclusions()
+        else:
+            if self.updates:
+                self._show_updates_view()
+            else:
+                self._show_empty_state("up_to_date")
+            self.manage_exclusions_button.setText("Manage Exclusions")
+            self.status_label.setText(
+                f"Found {len(self.updates)} update(s)"
+                if self.updates
+                else "Ready to scan for updates"
+            )
 
-        def _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam):
-            try:
-                nid = (self_notifier.hwnd, 0)  # type: ignore[attr-defined]
-                toast_mod.Shell_NotifyIcon(toast_mod.NIM_DELETE, nid)
-            except Exception:
-                pass
-            try:
-                toast_mod.PostQuitMessage(0)
-            except Exception:
-                pass
-            return 0
+    def lock_controls(self) -> None:
+        self.check_button.setEnabled(False)
+        self.update_all_button.setEnabled(False)
+        self.update_selected_button.setEnabled(False)
+        self.manage_exclusions_button.setEnabled(False)
 
-        def _safe_wnd_proc(self_notifier, hwnd, msg, wparam, lparam, **kwargs):
-            try:
-                if lparam == toast_mod.PARAM_CLICKED:
-                    callback = kwargs.get("callback")
-                    if callback:
-                        try:
-                            callback()
-                        except Exception:
-                            pass
-                    _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam)
-                elif lparam == toast_mod.PARAM_DESTROY:
-                    _safe_on_destroy(self_notifier, hwnd, msg, wparam, lparam)
-            except Exception:
-                pass
-            return 0
+    def unlock_controls(self) -> None:
+        self.check_button.setEnabled(True)
+        self.manage_exclusions_button.setEnabled(True)
+        self.update_all_button.setEnabled(bool(self.updates))
+        self.update_selected_button.setEnabled(
+            bool(self.updates) and bool(self.table.selectionModel().selectedRows())
+        )
 
-        notifier.on_destroy = MethodType(_safe_on_destroy, notifier)  # type: ignore[assignment]
-        notifier.wnd_proc = MethodType(_safe_wnd_proc, notifier)  # type: ignore[assignment]
+    def _start_scan_watchdog(self) -> None:
+        self._scan_watchdog.stop()
+        self._scan_watchdog.start((WINGET_TIMEOUT_SECONDS * 1000) + 2000)
 
-    # ------------------------------------------------------------------
-    # UI event handlers
-    # ------------------------------------------------------------------
+    def _stop_scan_watchdog(self) -> None:
+        if self._scan_watchdog.isActive():
+            self._scan_watchdog.stop()
+
+    def _finish_scan(self) -> None:
+        self.scan_in_progress = False
+        self._stop_scan_watchdog()
+
+    def _handle_scan_timeout(self) -> None:
+        if not self.scan_in_progress:
+            return
+        self.scan_in_progress = False
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.footer_status.setText("Idle")
+        self.status_label.setText("Scan timed out")
+        self._show_empty_state("idle")
+        self.unlock_controls()
+        QMessageBox.critical(
+            self,
+            "Error",
+            f"winget timed out after {WINGET_TIMEOUT_SECONDS} seconds",
+        )
+
     def check_for_updates(self) -> None:
-        """Kick off a background scan for available updates via winget.
-
-        Disables the main control buttons while scanning, clears the
-        existing table, and starts the progress bar.  The actual work
-        happens in a separate thread to keep the GUI responsive.
-        """
         if self.update_in_progress:
-            messagebox.showwarning("Warning", "An update is already in progress")
+            QMessageBox.warning(self, "Warning", "An update is already in progress")
             return
-
-        # Disable user interaction while scanning
-        self.check_button.config(state=tk.DISABLED)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
-        self.status_label.config(text="Checking for updates...")
-        self.progress.config(mode="indeterminate")
-        self.progress.start()
-
-        # Clear previous results from the treeview and internal list
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        if self.scan_in_progress:
+            QMessageBox.information(self, "Info", "A scan is already in progress")
+            return
+        self.scan_in_progress = True
+        self._start_scan_watchdog()
+        self.status_label.setText("Checking for updates...")
+        self.footer_status.setText("Scanning winget catalog")
+        self.progress.setRange(0, 0)
+        self.lock_controls()
+        self._show_empty_state("scanning")
+        self.table.setRowCount(0)
         self.updates.clear()
+        self.updates_by_id.clear()
+        self.result_counter.setText("0 updates")
 
-        # Start scan in a background thread
-        threading.Thread(target=self._check_for_updates_thread, daemon=True).start()
+        worker = ScanWorker(self.fake_updates, self.excluded_updates, self.skipped_updates)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._handle_scan_results)
+        worker.size_ready.connect(self._handle_size_ready)
+        worker.error.connect(self._handle_scan_error)
+        worker.finished.connect(self._finish_scan)
+        worker.finished.connect(self._handle_scan_thread_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._current_thread = thread
+        self._scan_worker = worker  # retain so it is not garbage collected
+        thread.start()
 
-    # ------------------------------------------------------------------
-    # Exclusions manager (in-place view)
-    # ------------------------------------------------------------------
-    def show_exclusions_view(self) -> None:
-        """Switch main content to the exclusions manager view."""
-        # Cache current home status to restore when returning
-        try:
-            self._home_status_cache = self.status_label.cget("text")
-        except Exception:
-            self._home_status_cache = "Click 'Check for Updates' to begin"
-        # Hide update controls while managing exclusions
-        self.check_button.config(state=tk.DISABLED)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
-        # Toggle toolbar buttons
-        try:
-            self.manage_exclusions_button.pack_forget()
-        except Exception:
-            pass
-        try:
-            self.back_button.pack(side=tk.LEFT, padx=(8, 0))
-        except Exception:
-            pass
+    def _handle_scan_error(self, message: str) -> None:
+        self._finish_scan()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.footer_status.setText("Idle")
+        self.status_label.setText("Error occurred")
+        self._show_empty_state("idle")
+        self.unlock_controls()
+        QMessageBox.critical(self, "Error", message)
 
-        # Hide updates table
-        try:
-            self.tree_frame.grid_remove()
-        except Exception:
-            pass
-
-        # Build exclusions frame once
-        if not hasattr(self, "exclusions_frame") or self.exclusions_frame is None:
-            self.exclusions_frame = ttk.Frame(self.main_frame)
-            self.exclusions_frame.grid(row=2, column=0, columnspan=3, sticky=tk.NSEW)
-            excl_scroll = ttk.Scrollbar(self.exclusions_frame)
-            excl_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-            self.exclusions_tree = ttk.Treeview(
-                self.exclusions_frame,
-                columns=("name", "action"),
-                show="headings",
-                yscrollcommand=excl_scroll.set,
-                selectmode="browse",
-            )
-            self.exclusions_tree.heading("name", text="Software Name")
-            self.exclusions_tree.heading("action", text="Action")
-            self.exclusions_tree.column("name", width=480, anchor="w")
-            self.exclusions_tree.column("action", width=140, anchor="center")
-            self.exclusions_tree.pack(fill=tk.BOTH, expand=True)
-            excl_scroll.config(command=self.exclusions_tree.yview)
-            # Handle click on action column
-            self.exclusions_tree.bind("<Button-1>", self._handle_exclusions_click)
-        else:
-            self.exclusions_frame.grid()
-
-        self.status_label.config(text="Manage Exclusions")
-        # Populate asynchronously
-        threading.Thread(target=self._load_exclusions_data_thread, daemon=True).start()
-
-    def show_updates_view(self) -> None:
-        """Return to the main updates view."""
-        # Hide exclusions frame
-        try:
-            if hasattr(self, "exclusions_frame") and self.exclusions_frame:
-                self.exclusions_frame.grid_remove()
-        except Exception:
-            pass
-        # Show updates table
-        try:
-            self.tree_frame.grid()
-        except Exception:
-            pass
-        # Toggle toolbar buttons
-        try:
-            self.back_button.pack_forget()
-        except Exception:
-            pass
-        try:
-            self.manage_exclusions_button.pack(side=tk.LEFT, padx=(8, 0))
-        except Exception:
-            pass
-        # Restore button states depending on data
-        self.check_button.config(state=tk.NORMAL)
-        if self.updates:
-            self.update_all_button.config(state=tk.NORMAL)
-            self.update_selected_button.config(
-                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
-            )
-        else:
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
-
-        # Restore previous home status text (or fallback)
-        try:
-            previous = getattr(self, "_home_status_cache", None)
-            if previous:
-                self.status_label.config(text=previous)
-            else:
-                # Derive a sensible default
-                if self.updates:
-                    self.status_label.config(
-                        text=f"Found {len(self.updates)} available update{'s' if len(self.updates) != 1 else ''}"
-                    )
-                else:
-                    self.status_label.config(text="Click 'Check for Updates' to begin")
-        except Exception:
-            pass
-
-    def _load_exclusions_data_thread(self) -> None:
-        """Load excluded IDs, resolve names via winget search, and populate tree."""
-        ids = list(self.excluded_updates.keys())
-        entries: List[Dict[str, str]] = []
-
-        def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            return subprocess.run(
-                command,
-                startupinfo=startupinfo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-        for pid in ids:
-            name = ""
-            try:
-                # Prefer search table to extract display name reliably
-                res = run_command_silently(["winget", "search", "--id", pid, "--exact"])
-                out = res.stdout or ""
-                # Find the data row that contains the exact id and read the name from start up to id column
-                for line in out.splitlines():
-                    if pid in line and not line.strip().startswith(("Name", "--")):
-                        m = re.match(rf"^(.*?)\s{{2,}}{re.escape(pid)}(\s|$)", line)
-                        if m:
-                            cand = m.group(1).strip()
-                            if cand:
-                                name = cand
-                                break
-                if not name:
-                    # Fallback to 'show' parsing
-                    res2 = run_command_silently(["winget", "show", "--id", pid, "--exact"])
-                    match = re.search(r"^Name:\s*(.+)$", res2.stdout or "", re.IGNORECASE | re.MULTILINE)
-                    if match:
-                        name = match.group(1).strip()
-            except Exception:
-                pass
-            if not name:
-                name = pid
-            entries.append({"id": pid, "name": name})
-
-        def populate():
-            # Clear items and insert fresh with 'Unexclude' actions
-            try:
-                for item in self.exclusions_tree.get_children():
-                    self.exclusions_tree.delete(item)
-            except Exception:
-                pass
-            for e in entries:
-                self.exclusions_tree.insert(
-                    "",
-                    tk.END,
-                    iid=e["id"],
-                    values=(e["name"], "Unexclude"),
-                )
-            if entries:
-                self.status_label.config(text=f"Manage Exclusions - {len(entries)} item(s)")
-            else:
-                self.status_label.config(text="No excluded packages")
-
-        self.root.after(0, populate)
-
-    def _handle_exclusions_click(self, event: tk.Event) -> None:
-        item = self.exclusions_tree.identify_row(event.y)
-        column = self.exclusions_tree.identify_column(event.x)
-        if not item:
-            return
-        if column == "#2":  # Action column
-            self._unexclude_from_manager(item)
-
-    def _unexclude_from_manager(self, package_id: str) -> None:
-        if package_id in self.excluded_updates:
-            try:
-                self.excluded_updates.pop(package_id, None)
-                self._save_json(self.EXCLUDED_UPDATES_FILE, self.excluded_updates)
-            except Exception as e:
-                messagebox.showerror("Error", f"Error saving exclusions: {e}")
-                return
-        try:
-            self.exclusions_tree.delete(package_id)
-        except Exception:
-            pass
-        # Update status
-        remaining = len(self.exclusions_tree.get_children())
-        if remaining:
-            self.status_label.config(text=f"Manage Exclusions — {remaining} item(s)")
-        else:
-            self.status_label.config(text="No excluded packages")
-
-    def _check_for_updates_thread(self) -> None:
-        """Worker thread for scanning available updates via winget.
-
-        This method calls ``winget upgrade --accept-source-agreements`` and
-        parses its output to build the list of available updates.  It
-        filters out packages present in the ``fake_updates`` and
-        ``excluded_updates`` dictionaries.  File sizes and executable
-        paths are resolved before populating the UI on the main thread.
-        """
-
-        def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            return subprocess.run(
-                command,
-                startupinfo=startupinfo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-        def get_file_size(package_id: str) -> Optional[float]:
-            """Resolve the installer size in megabytes for a given package."""
-            try:
-                result = run_command_silently(["winget", "show", package_id])
-                match = re.search(
-                    r"Installer Url:\s*(https?://[^\s]+\.exe)",
-                    result.stdout,
-                    re.IGNORECASE,
-                )
-                if match:
-                    link = match.group(1)
-                    try:
-                        response = requests.head(link, allow_redirects=True, timeout=10)
-                        if "Content-Length" not in response.headers:
-                            response = requests.get(link, stream=True, timeout=10)
-                        size_bytes = int(response.headers.get("Content-Length", 0))
-                        if size_bytes <= 0:
-                            return None
-                        size_mb = round(size_bytes / (1024 * 1024), 2)
-                        return size_mb
-                    except Exception:
-                        return None
-            except Exception:
-                return None
-            return None
-
-        def get_executable_path(package_id: str, package_name: str) -> Optional[str]:
-            """Attempt to find the installed executable for a package."""
-            try:
-                result = run_command_silently(["winget", "show", "--id", package_id, "--exact"])
-                output = result.stdout
-                match = re.search(
-                    r"Install Location:\s*(.*?)\n",
-                    output,
-                    re.IGNORECASE,
-                )
-                if match:
-                    install_path = match.group(1).strip()
-                    if install_path and os.path.exists(install_path):
-                        for root_dir, _, files in os.walk(install_path):
-                            for file in files:
-                                if file.lower().endswith(".exe") and (
-                                    package_name.lower() in file.lower()
-                                    or package_id.lower() in file.lower()
-                                ):
-                                    return os.path.join(root_dir, file)
-            except Exception:
-                return None
-            return None
-
-        skipped_changed = False
-
-        try:
-            result = run_command_silently(["winget", "upgrade", "--accept-source-agreements"])
-            lines = result.stdout.split("\n")
-            start_index = 0
-            for i, line in enumerate(lines):
-                if line.startswith("Name") and "Id" in line:
-                    start_index = i + 1
-                    break
-            lines = lines[start_index:]
-            temp_updates: List[Dict[str, Optional[str]]] = []
-            for line in lines:
-                if line.strip() and not line.startswith("-"):
-                    line = line.replace("winget", "")
-                    pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^)]+\))?)\s+([^\s]+\s*(?:\([^)]+\))?)$"
-                    match = re.match(pattern, line.strip())
-                    parts: List[str] = []
-                    if match:
-                        parts = [
-                            match.group(1).strip(),
-                            match.group(2).strip(),
-                            match.group(3).strip(),
-                            match.group(4).strip(),
-                        ]
-                    if len(parts) >= 4:
-                        package_name, package_id, installed_version, available_version = parts
-                        if (
-                            package_id in self.fake_updates
-                            and self.fake_updates[package_id] == available_version
-                        ) or (package_id in self.excluded_updates):
-                            continue
-                        skip_version = self.skipped_updates.get(package_id)
-                        if skip_version == available_version:
-                            continue
-                        if skip_version is not None and skip_version != available_version:
-                            self.skipped_updates.pop(package_id, None)
-                            skipped_changed = True
-                        file_size = get_file_size(package_id)
-                        executable_path = get_executable_path(package_id, package_name)
-                        temp_updates.append(
-                            {
-                                "name": package_name,
-                                "id": package_id,
-                                "installed_version": installed_version,
-                                "available_version": available_version,
-                                "file_size": file_size,
-                                "executable_path": executable_path,
-                            }
-                        )
-            self.root.after(0, self._display_updates, temp_updates)
-        except subprocess.CalledProcessError as e:
-            self.root.after(
-                0,
-                self._show_error,
-                f"Error checking for updates: {e.stderr}",
-            )
-        except FileNotFoundError:
-            self.root.after(
-                0,
-                self._show_error,
-                "winget not found. Please install Windows Package Manager.",
-            )
-        finally:
-            self.root.after(0, self._stop_progress)
-            if skipped_changed:
-                self.root.after(0, self._persist_skipped_updates)
-
-    def _display_updates(self, updates: List[Dict[str, Optional[str]]]) -> None:
-        """Populate the treeview with a list of update dictionaries."""
+    def _handle_scan_results(
+        self, updates: List[UpdateItem], new_skipped: Dict[str, str], skipped_changed: bool
+    ) -> None:
+        self._finish_scan()
         self.updates = updates
-        for update in updates:
-            package_id = update["id"]
-            file_size_str = (
-                f"{update['file_size']} MB" if update["file_size"] is not None else "N/A"
-            )
-            self.tree.insert(
-                "",
-                tk.END,
-                iid=package_id,
-                values=(
-                    update["name"],
-                    update["installed_version"],
-                    update["available_version"],
-                    file_size_str,
-                    "Update",
-                    "Exclude",
-                    "Skip",
-                ),
-            )
+        self.updates_by_id = {u.package_id: u for u in updates}
+        if skipped_changed:
+            try:
+                save_json(self.skipped_updates_path, new_skipped)
+                self.skipped_updates = new_skipped
+            except Exception as exc:
+                QMessageBox.warning(self, "Warning", str(exc))
+        self.render_updates()
         if updates:
-            self.status_label.config(
-                text=f"Found {len(updates)} available update{'s' if len(updates) != 1 else ''}"
-            )
-            self.update_all_button.config(state=tk.NORMAL)
-            self.update_selected_button.config(state=tk.NORMAL)
-            self.show_notification(len(updates))
+            self._show_updates_view()
+            self.status_label.setText(f"Found {len(updates)} update(s)")
+            if self.tray:
+                self.tray.showMessage(
+                    "Updates available",
+                    f"{len(updates)} update(s) ready to install.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    5000,
+                )
         else:
-            self.status_label.config(text="No updates available")
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
-        self.check_button.config(state=tk.NORMAL)
-
-    def _handle_tree_click(self, event: tk.Event) -> None:
-        """Respond to clicks on the treeview to handle inline actions."""
-        if self.update_in_progress:
-            return
-        item = self.tree.identify_row(event.y)
-        column = self.tree.identify_column(event.x)
-        if not item:
-            return
-        if column == "#5":
-            package_id = item
-            self._update_single_by_id(package_id)
-        elif column == "#6":
-            package_id = item
-            self._exclude_package_by_id(package_id)
-        elif column == "#7":
-            package_id = item
-            self._skip_version_by_id(package_id)
-
-    def _handle_selection_change(self, event: tk.Event) -> None:
-        """Enable or disable the 'Update Selected' button based on selection."""
-        if self.update_in_progress:
-            return
-        selected = bool(self.tree.selection())
-        if selected and self.updates:
-            self.update_selected_button.config(state=tk.NORMAL)
+            self._show_empty_state("up_to_date")
+            self.status_label.setText("No updates available")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        if updates and ENABLE_FILESIZE_SCAN:
+            self.footer_status.setText("Fetching download sizes")
         else:
-            self.update_selected_button.config(state=tk.DISABLED)
+            self.footer_status.setText("Idle")
+        self.unlock_controls()
+        self.result_counter.setText(f"{len(updates)} updates")
 
-    # ------------------------------------------------------------------
-    # Update actions
-    # ------------------------------------------------------------------
-    def _update_single_by_id(self, package_id: str) -> None:
-        """Prompt the user and update a single package identified by id."""
-        if self.update_in_progress:
-            messagebox.showwarning("Warning", "An update is already in progress")
+    def _handle_size_ready(self, package_id: str, size: float) -> None:
+        update = self.updates_by_id.get(package_id)
+        if update is None:
             return
-        update = next((u for u in self.updates if u["id"] == package_id), None)
+        update.file_size = size
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == package_id:
+                self.table.setItem(row, 3, QTableWidgetItem(f"{size} MB"))
+                break
+
+    def _handle_scan_thread_finished(self) -> None:
+        # Phase 2 (size fetching) is done; return the footer to idle.
+        if not self.scan_in_progress:
+            self.footer_status.setText("Idle")
+
+    def render_updates(self) -> None:
+        self.table.setRowCount(0)
+        for update in self.updates:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name_item = QTableWidgetItem(update.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, update.package_id)
+            self.table.setItem(row, 0, name_item)
+
+            installed_badge = VersionBadge(update.installed_version, variant="installed")
+            self.table.setCellWidget(row, 1, installed_badge)
+            available_badge = VersionBadge(update.available_version, variant="available")
+            self.table.setCellWidget(row, 2, available_badge)
+
+            if update.file_size is not None:
+                size_text = f"{update.file_size} MB"
+            elif ENABLE_FILESIZE_SCAN:
+                size_text = "…"
+            else:
+                size_text = "N/A"
+            self.table.setItem(row, 3, QTableWidgetItem(size_text))
+
+            update_btn = self._make_table_button("Update", "ActionUpdateButton")
+            update_btn.setToolTip(f"Update {update.name} to {update.available_version}")
+            update_btn.clicked.connect(lambda _, pid=update.package_id: self.update_single(pid))
+            self.table.setCellWidget(row, 4, update_btn)
+
+            exclude_btn = self._make_table_button("Exclude", "ActionExcludeButton")
+            exclude_btn.setToolTip(f"Permanently exclude {update.name} from updates")
+            exclude_btn.clicked.connect(lambda _, pid=update.package_id: self.exclude_package(pid))
+            self.table.setCellWidget(row, 5, exclude_btn)
+
+            skip_btn = self._make_table_button("Skip", "ActionSkipButton")
+            skip_btn.setToolTip(f"Skip version {update.available_version} of {update.name}")
+            skip_btn.clicked.connect(lambda _, pid=update.package_id: self.skip_version(pid))
+            self.table.setCellWidget(row, 6, skip_btn)
+
+            self.table.setRowHeight(row, 40)
+
+        self.apply_filter()
+        self.result_counter.setText(f"{len(self.updates)} updates")
+        self.update_selected_state()
+        self._update_badge()
+
+    def _make_table_button(self, text: str, obj_name: str) -> QToolButton:
+        btn = QToolButton()
+        btn.setText(text)
+        btn.setObjectName(obj_name)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        btn.setMinimumWidth(76)
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return btn
+
+    def update_single(self, package_id: str) -> None:
+        if self.update_in_progress:
+            QMessageBox.warning(self, "Warning", "An update is already in progress")
+            return
+        update = self.updates_by_id.get(package_id)
         if not update:
             return
-        package_name = update["name"]
-        if not messagebox.askyesno(
+        reply = QMessageBox.question(
+            self,
             "Confirm Update",
-            f"Update {package_name} to version {update['available_version']}?",
-        ):
+            f"Update {update.name} to version {update.available_version}?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
-        self.update_in_progress = True
-        self.status_label.config(text=f"Updating {package_name}...")
-        self.progress.config(mode="indeterminate")
-        self.progress.start()
-        self.check_button.config(state=tk.DISABLED)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
-        threading.Thread(
-            target=self._update_thread, args=([package_id],), daemon=True
-        ).start()
+        self.start_update([package_id], f"Updating {update.name}...")
 
     def update_selected(self) -> None:
-        """Update only the packages currently selected in the treeview."""
         if self.update_in_progress:
-            messagebox.showwarning("Warning", "An update is already in progress")
+            QMessageBox.warning(self, "Warning", "An update is already in progress")
             return
-        selected_items = self.tree.selection()
-        if not selected_items:
-            messagebox.showinfo("Info", "No software selected for update")
-            return
-        package_ids: List[str] = list(selected_items)
-        package_names = [
-            next(
-                (update["name"] for update in self.updates if update["id"] == pid),
-                pid,
-            )
-            for pid in package_ids
+        selected = [
+            self.table.item(row.row(), 0).data(Qt.ItemDataRole.UserRole)
+            for row in self.table.selectionModel().selectedRows()
         ]
-        if not messagebox.askyesno(
-            "Confirm Update",
-            f"Update {len(package_ids)} selected package{'s' if len(package_ids) != 1 else ''}?\n\n"
-            + "\n".join(package_names),
-        ):
+        if not selected:
+            QMessageBox.information(self, "Info", "No software selected for update")
             return
-        self.update_in_progress = True
-        self.status_label.config(text="Updating selected software...")
-        self.progress.config(mode="determinate", maximum=len(package_ids))
-        self.progress["value"] = 0
-        self.check_button.config(state=tk.DISABLED)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
-        threading.Thread(
-            target=self._update_thread,
-            args=(package_ids,),
-            daemon=True,
-        ).start()
+        reply = QMessageBox.question(
+            self,
+            "Confirm Update",
+            f"Update {len(selected)} selected package(s)?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.start_update(selected, "Updating selected software...")
 
     def update_all(self) -> None:
-        """Update all packages currently displayed in the treeview."""
         if self.update_in_progress:
-            messagebox.showwarning("Warning", "An update is already in progress")
+            QMessageBox.warning(self, "Warning", "An update is already in progress")
             return
         if not self.updates:
-            messagebox.showinfo("Info", "No updates available")
+            QMessageBox.information(self, "Info", "No updates available")
             return
-        package_ids = [update["id"] for update in self.updates]
-        package_names = [update["name"] for update in self.updates]
-        if not messagebox.askyesno(
+        reply = QMessageBox.question(
+            self,
             "Confirm Update",
-            f"Update all {len(package_ids)} package{'s' if len(package_ids) != 1 else ''}?\n\n"
-            + "\n".join(package_names),
-        ):
+            f"Update all {len(self.updates)} package(s)?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
-        self.update_in_progress = True
-        self.status_label.config(text="Updating all software...")
-        self.progress.config(mode="determinate", maximum=len(package_ids))
-        self.progress["value"] = 0
-        self.check_button.config(state=tk.DISABLED)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
-        threading.Thread(
-            target=self._update_thread,
-            args=(package_ids,),
-            daemon=True,
-        ).start()
+        package_ids = [u.package_id for u in self.updates]
+        self.start_update(package_ids, "Updating all software...")
 
-    # ------------------------------------------------------------------
-    # Exclusion handling
-    # ------------------------------------------------------------------
-    def _exclude_package_by_id(self, package_id: str) -> None:
-        """Permanently exclude a package from future scans."""
+    def start_update(self, package_ids: List[str], status_text: str) -> None:
+        self.update_in_progress = True
+        self._update_total = len(package_ids)
+        self._update_done = 0
+        self.status_label.setText(status_text)
+        self.footer_status.setText("Updating packages")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.lock_controls()
+
+        worker = UpdateWorker(package_ids, self.updates_by_id)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._handle_update_progress)
+        worker.package_progress.connect(self._handle_package_progress)
+        worker.item_complete.connect(self._handle_item_complete)
+        worker.error.connect(self._handle_update_error)
+        worker.finished.connect(self._handle_update_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._current_thread = thread
+        self._update_worker = worker  # retain so it is not garbage collected
+        thread.start()
+
+    def _handle_package_progress(self, package_id: str, percent: int) -> None:
+        # Combine the current package's live percent with overall completion so
+        # the bar reflects real winget download/install progress end to end.
+        total = max(1, self._update_total)
+        overall = int((self._update_done + percent / 100.0) / total * 100)
+        self.progress.setValue(max(0, min(100, overall)))
+        update = self.updates_by_id.get(package_id)
+        name = update.name if update else package_id
+        self.status_label.setText(f"Updating {name}… {percent}%")
+        self.footer_status.setText(
+            f"Updating {name} ({self._update_done + 1}/{total}) — {percent}%"
+        )
+
+    def _handle_update_progress(self, index: int, total: int, package_id: str) -> None:
+        self._update_done = index
+        self.progress.setValue(int(index / max(1, total) * 100))
+        update = self.updates_by_id.get(package_id)
+        if update:
+            self.footer_status.setText(f"Updated {update.name} ({index}/{total})")
+
+    def _handle_item_complete(
+        self, package_id: str, success: bool, fake_update: bool, message: str
+    ) -> None:
+        if fake_update:
+            update = self.updates_by_id.get(package_id)
+            if update:
+                self.fake_updates[package_id] = update.available_version
+                try:
+                    save_json(self.fake_updates_path, self.fake_updates)
+                except Exception as exc:
+                    QMessageBox.warning(self, "Warning", str(exc))
+            self.remove_update(package_id)
+            return
+        if success:
+            update = self.updates_by_id.get(package_id)
+            self.remove_update(package_id)
+            if update and self.tray:
+                self.tray.showMessage(
+                    "Update complete",
+                    f"{update.name} updated successfully.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000,
+                )
+
+    def _handle_update_error(self, message: str) -> None:
+        QMessageBox.critical(self, "Update Error", message)
+
+    def _handle_update_finished(self, success: bool) -> None:
+        self.update_in_progress = False
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.footer_status.setText("Idle")
+        if success:
+            if not self.updates:
+                self.status_label.setText("All updates completed")
+                QMessageBox.information(self, "Success", "All updates completed successfully")
+            else:
+                self.status_label.setText(f"Found {len(self.updates)} update(s)")
+        else:
+            self.status_label.setText("Update failed")
+        self.unlock_controls()
+        self.update_selected_state()
+        self._update_badge()
+
+    def remove_update(self, package_id: str) -> None:
+        row_to_remove = None
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == package_id:
+                row_to_remove = row
+                break
+        if row_to_remove is not None:
+            self.table.removeRow(row_to_remove)
+        self.updates = [u for u in self.updates if u.package_id != package_id]
+        self.updates_by_id.pop(package_id, None)
+        self.result_counter.setText(f"{len(self.updates)} updates")
+        self._update_badge()
+        if not self.updates:
+            self.status_label.setText("No updates available")
+            self._show_empty_state("up_to_date")
+
+    def exclude_package(self, package_id: str) -> None:
         if package_id in self.excluded_updates:
             return
-        update = next((u for u in self.updates if u["id"] == package_id), None)
+        update = self.updates_by_id.get(package_id)
         if not update:
             return
-        package_name = update["name"]
-        if not messagebox.askyesno(
+        reply = QMessageBox.question(
+            self,
             "Confirm Exclusion",
-            f"Exclude updates for {package_name} permanently?",
-        ):
+            f"Exclude updates for {update.name} permanently?",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
         try:
             self.excluded_updates[package_id] = True
-            self._save_json(self.EXCLUDED_UPDATES_FILE, self.excluded_updates)
-            self._remove_package_by_id(package_id)
-            self.status_label.config(text=f"Excluded {package_name} from updates")
-            if self.updates:
-                self.update_all_button.config(state=tk.NORMAL)
-                self.update_selected_button.config(
-                    state=tk.NORMAL if self.tree.selection() else tk.DISABLED
-                )
-            else:
-                self.update_all_button.config(state=tk.DISABLED)
-                self.update_selected_button.config(state=tk.DISABLED)
-        except Exception as e:
-            self._show_error(f"Error excluding package: {e}")
+            save_json(self.excluded_updates_path, self.excluded_updates)
+            self.remove_update(package_id)
+            self.status_label.setText(f"Excluded {update.name} from updates")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Error excluding package: {exc}")
+        self.unlock_controls()
 
-    def _skip_version_by_id(self, package_id: str) -> None:
-        """Skip the currently offered version for a package."""
+    def skip_version(self, package_id: str) -> None:
         if self.update_in_progress:
-            messagebox.showwarning("Warning", "An update is already in progress")
+            QMessageBox.warning(self, "Warning", "An update is already in progress")
             return
-        update = next((u for u in self.updates if u["id"] == package_id), None)
+        update = self.updates_by_id.get(package_id)
         if not update:
             return
-        package_name = update["name"]
-        available_version = update.get("available_version")
+        available_version = update.available_version
         if not available_version:
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Skip Version",
-                f"Unable to skip {package_name} because no version information is available.",
+                f"Unable to skip {update.name} because no version information is available.",
             )
             return
         if self.skipped_updates.get(package_id) == available_version:
-            # Already skipped; nothing to do.
-            self._remove_package_by_id(package_id)
+            self.remove_update(package_id)
             return
-        if not messagebox.askyesno(
+        reply = QMessageBox.question(
+            self,
             "Skip This Version",
             (
-                f"Skip version {available_version} of {package_name}?\n\n"
+                f"Skip version {available_version} of {update.name}?\n\n"
                 "You will see this software again when a newer version is released."
             ),
-        ):
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
         try:
             self.skipped_updates[package_id] = available_version
-            self._save_json(self.SKIPPED_UPDATES_FILE, self.skipped_updates)
-        except Exception as e:
-            messagebox.showerror("Error", f"Error saving skipped version: {e}")
+            save_json(self.skipped_updates_path, self.skipped_updates)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Error saving skipped version: {exc}")
             return
-        self._remove_package_by_id(package_id)
-        self.status_label.config(
-            text=f"Skipped {package_name} (version {available_version})"
-        )
-        if self.updates:
-            self.update_all_button.config(state=tk.NORMAL)
-            self.update_selected_button.config(
-                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
-            )
+        self.remove_update(package_id)
+        self.status_label.setText(f"Skipped {update.name} (version {available_version})")
+        self.unlock_controls()
+
+    def load_exclusions(self) -> None:
+        self.exclusions_table.setRowCount(0)
+        self.status_label.setText("Loading exclusions...")
+        worker = ExclusionsWorker(list(self.excluded_updates.keys()))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.result.connect(self._render_exclusions)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._current_thread = thread
+        self._exclusions_worker = worker  # retain so it is not garbage collected
+        thread.start()
+
+    def _render_exclusions(self, entries: List[Tuple[str, str]]) -> None:
+        self.exclusions_table.setRowCount(0)
+        for package_id, name in entries:
+            row = self.exclusions_table.rowCount()
+            self.exclusions_table.insertRow(row)
+            name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.ItemDataRole.UserRole, package_id)
+            self.exclusions_table.setItem(row, 0, name_item)
+            action_btn = self._make_table_button("Unexclude", "ActionButton")
+            action_btn.clicked.connect(lambda _, pid=package_id: self.unexclude(pid))
+            self.exclusions_table.setCellWidget(row, 1, action_btn)
+            self.exclusions_table.setRowHeight(row, 44)
+        if entries:
+            self.status_label.setText(f"Manage Exclusions - {len(entries)} item(s)")
         else:
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
+            self.status_label.setText("No excluded packages")
 
-    def _remove_package_by_id(self, package_id: str) -> None:
-        """Remove a package from the treeview and internal list by id."""
-        try:
-            self.tree.delete(package_id)
-        except Exception:
-            pass
-        self.updates = [u for u in self.updates if u["id"] != package_id]
-        if not self.updates:
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
-
-    # ------------------------------------------------------------------
-    # Worker thread for performing updates
-    # ------------------------------------------------------------------
-    def _update_thread(self, package_ids: List[str]) -> None:
-        """Background worker that iterates over a list of package ids.
-
-        Each package is updated by executing ``winget upgrade <id>``.  The
-        result of the command is parsed for success.  On successful
-        completion the package is removed from the UI; if the update
-        fails due to a fake update ("no package found" or "not
-        installed") then the package is recorded in the fake updates
-        file.  Any other error will trigger the error dialog and abort
-        the batch.
-        """
-        def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            return subprocess.run(
-                command,
-                startupinfo=startupinfo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-        success = True
-        error_message = ""
-        for i, package_id in enumerate(package_ids):
-            command = ["winget", "upgrade", package_id, "--accept-source-agreements"]
-            result = run_command_silently(command)
-            stdout = result.stdout.strip() if result.stdout else ""
-            stderr = result.stderr.strip() if result.stderr else ""
-            combined_output = (stdout + " " + stderr).lower()
-            if result.returncode == 0 or "successfully upgraded" in combined_output:
-                # Capture the display name before the UI thread potentially removes the item
-                try:
-                    update_obj = next((u for u in self.updates if u["id"] == package_id), None)
-                    pkg_name = (
-                        update_obj.get("name", package_id)
-                        if update_obj
-                        else package_id
-                    )
-                except Exception:
-                    pkg_name = package_id
-
-                self.root.after(0, self._remove_package_by_id, package_id)
-                self.root.after(0, lambda v=i + 1: self.progress.config(value=v))
-
-                # Send a completion toast notification for this package
-                if self.completion_notifier:
-                    try:
-                        self.completion_notifier.show_toast(
-                            f"{pkg_name} Updated",
-                            f"{pkg_name} has been successfully updated.",
-                            icon_path=self.icon_path,
-                            duration=5,
-                            threaded=True,
-                        )
-                    except Exception:
-                        pass
-            else:
-                if "no package found" in combined_output or "not installed" in combined_output:
-                    self.root.after(0, self._handle_fake_update_by_id, package_id)
-                else:
-                    success = False
-                    error_message = stderr or stdout or "Unknown error occurred"
-                    self.root.after(
-                        0,
-                        self._update_complete,
-                        False,
-                        f"Error updating {package_id}",
-                        package_id,
-                    )
-                    return
-        if success:
-            self.root.after(0, self._update_complete, True, "All updates completed successfully")
-
-    def _handle_fake_update_by_id(self, package_id: str) -> None:
-        """Record a fake update and remove it from the list."""
-        update = next((u for u in self.updates if u["id"] == package_id), None)
-        if not update:
-            return
-        package_name = update["name"]
-        package_version = update["available_version"]
-        self.fake_updates[package_id] = package_version
-        try:
-            self._save_json(self.FAKE_UPDATES_FILE, self.fake_updates)
-        except Exception as e:
-            self._show_error(str(e))
-        self._remove_package_by_id(package_id)
-        self.status_label.config(text=f"Removed fake update for {package_name}")
-
-    # ------------------------------------------------------------------
-    # Completion and error handling
-    # ------------------------------------------------------------------
-    def _update_complete(self, success: bool, message: str, package_id: Optional[str] = None) -> None:
-        """Finalize UI state after an update operation."""
-        self.update_in_progress = False
-        self._stop_progress()
-        if success:
-            self.status_label.config(text=message)
-            if not self.updates:
-                messagebox.showinfo("Success", message)
-        else:
-            self.status_label.config(text="Update failed")
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Update Error")
-            dialog.geometry("300x130")
-            dialog.transient(self.root)
-            dialog.grab_set()
-            dialog.resizable(False, False)
-            screen_width = dialog.winfo_screenwidth()
-            screen_height = dialog.winfo_screenheight()
-            x = (screen_width - 300) // 2
-            y = (screen_height - 130) // 2
-            dialog.geometry(f"300x130+{x}+{y}")
+    def unexclude(self, package_id: str) -> None:
+        if package_id in self.excluded_updates:
             try:
-                dialog.iconbitmap(self.icon_path)
-            except Exception:
-                pass
-            dialog_frame = ttk.Frame(dialog, padding="10")
-            dialog_frame.pack(fill=tk.BOTH, expand=True)
-            ttk.Label(
-                dialog_frame,
-                text=message,
-                style="Dialog.TLabel",
-                justify=tk.CENTER,
-                wraplength=350,
-            ).pack(pady=(10, 15))
-            button_frame = ttk.Frame(dialog_frame)
-            button_frame.pack(pady=10)
-            ttk.Button(
-                button_frame,
-                text="Close",
-                command=dialog.destroy,
-                width=12,
-            ).pack(side=tk.LEFT, padx=10)
-        self.check_button.config(state=tk.NORMAL)
-        if self.updates:
-            self.update_all_button.config(state=tk.NORMAL)
-            self.update_selected_button.config(
-                state=tk.NORMAL if self.tree.selection() else tk.DISABLED
-            )
-        else:
-            self.update_all_button.config(state=tk.DISABLED)
-            self.update_selected_button.config(state=tk.DISABLED)
+                self.excluded_updates.pop(package_id, None)
+                save_json(self.excluded_updates_path, self.excluded_updates)
+            except Exception as exc:
+                QMessageBox.critical(self, "Error", f"Error saving exclusions: {exc}")
+                return
+        self.load_exclusions()
 
-    def _stop_progress(self) -> None:
-        """Stop and reset the progress bar."""
-        try:
-            self.progress.stop()
-            self.progress.config(mode="determinate", value=0)
-        except Exception:
-            pass
+    def closeEvent(self, event) -> None:
+        if self.tray:
+            self.tray.hide()
+        event.accept()
 
-    def _show_error(self, message: str) -> None:
-        """Display an error message and reset the UI state."""
-        self._stop_progress()
-        self.status_label.config(text="Error occurred")
-        messagebox.showerror("Error", message)
-        self.check_button.config(state=tk.NORMAL)
-        self.update_all_button.config(state=tk.DISABLED)
-        self.update_selected_button.config(state=tk.DISABLED)
+
+def build_logo_pixmap(size: int) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    gradient = QLinearGradient(0, 0, size, size)
+    gradient.setColorAt(0, QColor("#21D4FD"))
+    gradient.setColorAt(1, QColor("#2BD98A"))
+
+    painter.setBrush(gradient)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawRoundedRect(0, 0, size, size, size * 0.35, size * 0.35)
+
+    painter.setBrush(QColor("#0B0C0F"))
+    inset = int(size * 0.28)
+    painter.drawEllipse(inset, inset, size - inset * 2, size - inset * 2)
+
+    # Upward arrow inside the dark circle (represents "update").
+    cx, cy = size / 2, size / 2
+    arrow_h = size * 0.30
+    arrow_w = size * 0.20
+    path = QPainterPath()
+    path.moveTo(cx, cy - arrow_h / 2)
+    path.lineTo(cx + arrow_w / 2, cy)
+    path.lineTo(cx + arrow_w * 0.25, cy)
+    path.lineTo(cx + arrow_w * 0.25, cy + arrow_h / 2)
+    path.lineTo(cx - arrow_w * 0.25, cy + arrow_h / 2)
+    path.lineTo(cx - arrow_w * 0.25, cy)
+    path.lineTo(cx - arrow_w / 2, cy)
+    path.closeSubpath()
+
+    arrow_gradient = QLinearGradient(0, 0, size, size)
+    arrow_gradient.setColorAt(0, QColor("#21D4FD"))
+    arrow_gradient.setColorAt(1, QColor("#2BD98A"))
+    painter.setBrush(arrow_gradient)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawPath(path)
+
+    painter.end()
+    return pixmap
+
+
+def apply_dark_theme(app: QApplication) -> None:
+    palette = app.palette()
+    palette.setColor(palette.ColorRole.Window, QColor(BG))
+    palette.setColor(palette.ColorRole.WindowText, QColor(TEXT))
+    palette.setColor(palette.ColorRole.Base, QColor("#0F1116"))
+    palette.setColor(palette.ColorRole.AlternateBase, QColor("#12161C"))
+    palette.setColor(palette.ColorRole.Text, QColor(TEXT))
+    palette.setColor(palette.ColorRole.Button, QColor("#161A20"))
+    palette.setColor(palette.ColorRole.ButtonText, QColor(TEXT))
+    palette.setColor(palette.ColorRole.Highlight, QColor(ACCENT))
+    palette.setColor(palette.ColorRole.HighlightedText, QColor("#0B0C0F"))
+    app.setPalette(palette)
+
+    font = QFont("Bahnschrift", 10)
+    app.setFont(font)
+
+    app.setStyleSheet(
+        f"""
+        /* -- Base -- */
+        QMainWindow {{
+            background: {BG};
+        }}
+        QFrame#Shell {{
+            background: {PANEL};
+            border: 1px solid {PANEL_BORDER};
+            border-radius: 18px;
+        }}
+
+        /* -- Title Bar -- */
+        QFrame#TitleBar {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 {TITLE_BG_1}, stop:1 {TITLE_BG_2});
+            border: 1px solid {PANEL_BORDER};
+            border-radius: 16px;
+        }}
+        QLabel#TitleText {{
+            font-size: 14pt;
+            font-weight: 700;
+            color: #EAF5FF;
+        }}
+        QLabel#SubtitleText {{
+            font-size: 9pt;
+            color: #94A2B8;
+        }}
+        QToolButton#WindowControlButton {{
+            background: transparent;
+            border: none;
+            padding: 0px;
+        }}
+
+        /* -- Header / Section -- */
+        QLabel#SectionTitle {{
+            font-size: 14pt;
+            font-weight: 700;
+            color: #E9ECF2;
+        }}
+        QLabel#StatusText {{
+            font-size: 10pt;
+            color: {TEXT_MUTED};
+        }}
+        QLabel#HintText {{
+            color: #96A0B4;
+        }}
+        QLabel#CounterText {{
+            color: {ACCENT_SOFT};
+            font-weight: 600;
+        }}
+        QLabel#UpdateBadge {{
+            background: {ACCENT};
+            color: {BG};
+            font-size: 8pt;
+            font-weight: 700;
+            border-radius: 10px;
+            padding: 2px 8px;
+            min-width: 18px;
+        }}
+        QFrame#HeaderDivider {{
+            background: {PANEL_BORDER};
+            border: none;
+        }}
+
+        /* -- Search Bar -- */
+        QWidget#SearchBar {{
+            background: transparent;
+        }}
+        QToolButton#SearchClearButton {{
+            background: transparent;
+            border: none;
+            color: {TEXT_MUTED};
+            font-size: 10pt;
+        }}
+        QToolButton#SearchClearButton:hover {{
+            color: {TEXT};
+        }}
+
+        /* -- Empty State -- */
+        QLabel#EmptyStateTitle {{
+            font-size: 13pt;
+            font-weight: 600;
+            color: {TEXT};
+        }}
+        QLabel#EmptyStateSub {{
+            font-size: 9pt;
+            color: {TEXT_MUTED};
+        }}
+
+        /* -- Buttons -- */
+        QToolButton#PrimaryButton {{
+            background: {ACCENT};
+            color: {BG};
+            border: none;
+            border-radius: 10px;
+            padding: 8px 16px;
+            font-weight: 600;
+        }}
+        QToolButton#PrimaryButton:hover {{
+            background: {ACCENT_SOFT};
+        }}
+        QToolButton#PrimaryButton:disabled {{
+            background: #2B3A44;
+            color: #7C8A9A;
+        }}
+        QToolButton#GhostButton {{
+            background: {BUTTON_BG};
+            color: #E1E6EE;
+            border: 1px solid #262B36;
+            border-radius: 10px;
+            padding: 8px 14px;
+        }}
+        QToolButton#GhostButton:hover {{
+            border-color: {ACCENT};
+            color: {ACCENT_SOFT};
+        }}
+        QToolButton#GhostButton:disabled {{
+            color: #6F7A8A;
+            border-color: #20242D;
+        }}
+
+        /* -- Table Action Buttons -- */
+        QToolButton#ActionUpdateButton {{
+            background: rgba(33, 212, 253, 0.12);
+            color: {ACCENT_SOFT};
+            border: 1px solid {ACCENT};
+            border-radius: 7px;
+            padding: 4px 10px;
+            font-size: 8pt;
+            font-weight: 600;
+        }}
+        QToolButton#ActionUpdateButton:hover {{
+            background: rgba(33, 212, 253, 0.22);
+        }}
+        QToolButton#ActionExcludeButton {{
+            background: transparent;
+            color: {WARNING};
+            border: 1px solid {WARN_BORDER};
+            border-radius: 7px;
+            padding: 4px 10px;
+            font-size: 8pt;
+        }}
+        QToolButton#ActionExcludeButton:hover {{
+            background: rgba(240, 200, 75, 0.10);
+        }}
+        QToolButton#ActionSkipButton {{
+            background: transparent;
+            color: {TEXT_MUTED};
+            border: 1px solid {MUTED_BORDER};
+            border-radius: 7px;
+            padding: 4px 10px;
+            font-size: 8pt;
+        }}
+        QToolButton#ActionSkipButton:hover {{
+            color: {TEXT};
+            border-color: #3A4758;
+        }}
+        QToolButton#ActionButton {{
+            background: {BUTTON_BG};
+            color: #E1E6EE;
+            border: 1px solid {MUTED_BORDER};
+            border-radius: 8px;
+            padding: 5px 10px;
+            font-size: 8pt;
+        }}
+        QToolButton#ActionButton:hover {{
+            border-color: {ACCENT};
+            color: {ACCENT_SOFT};
+        }}
+
+        /* -- Inputs -- */
+        QLineEdit {{
+            background: {SURFACE};
+            border: 1px solid {BORDER_SOFT};
+            border-radius: 10px;
+            padding: 8px 12px;
+            color: {TEXT};
+        }}
+        QLineEdit:focus {{
+            border-color: {ACCENT};
+        }}
+
+        /* -- Table -- */
+        QTableWidget {{
+            background: {SURFACE};
+            border: 1px solid #1E2330;
+            border-radius: 12px;
+            gridline-color: #1A1E28;
+            color: #E6E9F0;
+            selection-background-color: #1E2B38;
+            selection-color: #EAF5FF;
+        }}
+        QTableWidget::item {{
+            padding: 4px 8px;
+        }}
+        QTableWidget::item:hover {{
+            background: {HOVER};
+        }}
+        QTableWidget::item:selected {{
+            background: #1E2B38;
+        }}
+        QHeaderView::section {{
+            background: #141821;
+            color: #B7C1D1;
+            padding: 8px;
+            border: none;
+            font-weight: 600;
+        }}
+        QTableCornerButton::section {{
+            background: #141821;
+            border: none;
+        }}
+
+        /* -- Scrollbars -- */
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 6px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {BORDER_MID};
+            border-radius: 3px;
+            min-height: 30px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background: #3A4560;
+        }}
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical {{
+            background: transparent;
+        }}
+        QScrollBar:horizontal {{
+            background: transparent;
+            height: 6px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {BORDER_MID};
+            border-radius: 3px;
+            min-width: 30px;
+        }}
+        QScrollBar::handle:horizontal:hover {{
+            background: #3A4560;
+        }}
+        QScrollBar::add-line:horizontal,
+        QScrollBar::sub-line:horizontal {{
+            width: 0px;
+        }}
+        QScrollBar::add-page:horizontal,
+        QScrollBar::sub-page:horizontal {{
+            background: transparent;
+        }}
+
+        /* -- Progress Bar -- */
+        QProgressBar {{
+            background: {SURFACE};
+            border: 1px solid {BORDER_SOFT};
+            border-radius: 5px;
+            height: 6px;
+        }}
+        QProgressBar::chunk {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 {ACCENT}, stop:1 {SUCCESS});
+            border-radius: 5px;
+        }}
+
+        /* -- Footer -- */
+        QLabel#FooterText {{
+            color: #98A3B6;
+            font-size: 9pt;
+        }}
+
+        /* -- Message Box -- */
+        QMessageBox {{
+            background: {PANEL};
+            color: {TEXT};
+        }}
+        QMessageBox QLabel {{
+            color: {TEXT};
+            font-size: 10pt;
+        }}
+        QMessageBox QPushButton {{
+            background: {BUTTON_BG};
+            color: {TEXT};
+            border: 1px solid {BORDER_SOFT};
+            border-radius: 8px;
+            padding: 6px 18px;
+            min-width: 80px;
+        }}
+        QMessageBox QPushButton:hover {{
+            border-color: {ACCENT};
+            color: {ACCENT_SOFT};
+        }}
+        QMessageBox QPushButton:default {{
+            background: {ACCENT};
+            color: {BG};
+            border: none;
+            font-weight: 600;
+        }}
+
+        /* -- Tooltips -- */
+        QToolTip {{
+            background: #1A1F2B;
+            color: {TEXT};
+            border: 1px solid {ACCENT};
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 9pt;
+        }}
+
+        /* -- Context Menu -- */
+        QMenu {{
+            background: {PANEL};
+            color: {TEXT};
+            border: 1px solid #262B36;
+            border-radius: 8px;
+        }}
+        QMenu::item {{
+            padding: 6px 22px;
+        }}
+        QMenu::item:selected {{
+            background: #1A202B;
+            color: {ACCENT_SOFT};
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: {PANEL_BORDER};
+            margin: 4px 10px;
+        }}
+        """
+    )
 
 
 def main() -> None:
-    """Run the software updater as a standalone application."""
-    root = tk.Tk()
-    try:
-        base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        icon_path = os.path.join(base_path, "icon.ico")
-        root.iconbitmap(icon_path)
-    except Exception:
-        pass
-    app = SoftwareUpdater(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    apply_dark_theme(app)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

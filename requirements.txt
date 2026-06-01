@@ -1,3 +1,2 @@
-plyer==2.1.0
+PyQt6>=6.6
 requests==2.32.3
-win10toast-click==0.1.2

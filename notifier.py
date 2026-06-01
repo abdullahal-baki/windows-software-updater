@@ -1,19 +1,8 @@
 """
-Update notifier that uses Windows toast notifications to alert the user
-when software updates are available via winget.
+Update notifier using Qt system tray notifications.
 
-This script wraps ``winget upgrade`` in a lightweight class which
-parses the output, honours both "fake" and "excluded" updates, and
-displays a clickable toast.  Fake updates are updates reported by
-winget that cannot actually be applied (perhaps because the package
-isn't installed); these are persisted in a JSON file and ignored on
-subsequent runs.  Excluded updates are packages that the user has
-chosen to permanently ignore; these are also persisted in a JSON file
-and never counted towards the notification.
-
-To configure the file locations and icons, adjust the class
-attributes ``fake_updates_file`` and ``excluded_updates_file`` or pass
-your own paths when constructing ``UpdateNotifier``.
+Checks winget for updates, respects fake/excluded/skipped entries, and
+shows a toast notification that can launch the updater app.
 """
 
 import json
@@ -21,162 +10,182 @@ import os
 import re
 import subprocess
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from win10toast_click import ToastNotifier
+from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+
+WINGET_TIMEOUT_SECONDS = int(os.environ.get("WSU_WINGET_TIMEOUT", "120"))
+WINGET_REQUIRED_FLAGS = ["--accept-source-agreements"]
+WINGET_OPTIONAL_FLAGS = []
+if os.environ.get("WSU_WINGET_OPTIONAL_FLAGS", "0") == "1":
+    WINGET_OPTIONAL_FLAGS = ["--accept-package-agreements", "--disable-interactivity"]
+
+
+def resolve_data_path(filename: str) -> str:
+    cwd_path = os.path.join(os.getcwd(), filename)
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    for candidate in (cwd_path, local_path):
+        if os.path.exists(candidate):
+            return candidate
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".windows-software-updater")
+    app_dir = os.path.join(base, "WindowsSoftwareUpdater")
+    os.makedirs(app_dir, exist_ok=True)
+    return os.path.join(app_dir, filename)
+
+
+def load_json(path: str) -> Dict:
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_json(path: str, data: Dict) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4)
+    except Exception:
+        pass
+
+
+def run_command_silently(command: List[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    if timeout is None:
+        timeout = WINGET_TIMEOUT_SECONDS
+    try:
+        return subprocess.run(
+            command,
+            startupinfo=startupinfo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"winget timed out after {timeout} seconds") from exc
+
+
+def run_winget(args: List[str]) -> subprocess.CompletedProcess:
+    full_args = args + WINGET_REQUIRED_FLAGS + WINGET_OPTIONAL_FLAGS
+    result = run_command_silently(full_args)
+    if result.returncode != 0:
+        combined = f"{result.stdout} {result.stderr}".lower()
+        unknown_tokens = (
+            "unknown argument",
+            "unrecognized option",
+            "not recognized",
+            "unknown option",
+            "is not a valid option",
+        )
+        if any(token in combined for token in unknown_tokens):
+            result = run_command_silently(args + WINGET_REQUIRED_FLAGS)
+    return result
+
+
+def parse_upgrade_output(output: str) -> List[List[str]]:
+    lines = output.splitlines()
+    start_index = 0
+    for i, line in enumerate(lines):
+        if line.startswith("Name") and "Id" in line:
+            start_index = i + 1
+            break
+    entries: List[List[str]] = []
+    for line in lines[start_index:]:
+        if not line.strip() or line.strip().startswith("-"):
+            continue
+        cleaned = line.replace("winget", "").strip()
+        pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
+        match = re.match(pattern, cleaned)
+        if match:
+            entries.append([match.group(1), match.group(2), match.group(3), match.group(4)])
+        else:
+            parts = re.split(r"\s{2,}", cleaned)
+            if len(parts) >= 4:
+                entries.append(parts)
+    return entries
 
 
 class UpdateNotifier:
-    """Checks for pending software updates and shows a toast notification."""
-
     def __init__(self) -> None:
-        # Initialise variables
-        self.updates: List[Dict[str, str]] = []
-        # Path to JSON file recording fake updates
-        self.fake_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\fake_updates.json"
-        # Path to JSON file recording excluded updates
-        self.excluded_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\excluded_updates.json"
-        # Path to JSON file recording skipped (per-version) updates
-        self.skipped_updates_file = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\skipped_updates.json"
-        self.fake_updates: Dict[str, str] = self._load_json(self.fake_updates_file)
-        self.excluded_updates: Dict[str, bool] = self._load_json(self.excluded_updates_file)
-        self.skipped_updates: Dict[str, str] = self._load_json(self.skipped_updates_file)
+        self.app = QApplication.instance() or QApplication(sys.argv)
 
-        # Resolve icon and updater paths relative to the bundle when frozen
-        base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        self.icon_path = os.path.join(base_path, "icon.ico")
-        self.updater_path = r"C:\Users\Alamin\OneDrive\github\windows-software-updater\dist\Updater.exe"
+        self.fake_updates_file = resolve_data_path("fake_updates.json")
+        self.excluded_updates_file = resolve_data_path("excluded_updates.json")
+        self.skipped_updates_file = resolve_data_path("skipped_updates.json")
+        self.fake_updates: Dict[str, str] = load_json(self.fake_updates_file)
+        self.excluded_updates: Dict[str, bool] = load_json(self.excluded_updates_file)
+        self.skipped_updates: Dict[str, str] = load_json(self.skipped_updates_file)
 
-        self.toaster = ToastNotifier()
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_path, "icon.ico")
+        self.icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+        self.updater_path = os.path.join(base_path, "Updater.exe")
 
-        # Check for updates on startup
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            QTimer.singleShot(200, self.app.quit)
+            return
+
+        self.tray = QSystemTrayIcon(self.icon)
+        self.tray.messageClicked.connect(self._launch_updater)
+        self.tray.show()
         self.check_for_updates()
 
-    # ------------------------------------------------------------------
-    # JSON helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _load_json(path: str) -> Dict:
-        """Load a JSON file from disk and return an empty dict on error."""
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                return {}
-        return {}
-
-    @staticmethod
-    def _save_json(path: str, data: Dict) -> None:
-        """Persist a dictionary to disk as JSON, ignoring IO errors."""
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-        except Exception:
-            # Best-effort for notifier; ignore write issues
-            pass
-
-    # ------------------------------------------------------------------
-    # Updater launcher
-    # ------------------------------------------------------------------
     def _launch_updater(self) -> None:
-        """Launch the GUI updater application when the toast is clicked."""
         if os.path.exists(self.updater_path):
             os.startfile(self.updater_path)
 
     def show_notification(self, count: int) -> None:
-        """Show a toast informing the user about pending updates."""
         plural = "s" if count != 1 else ""
-        self.toaster.show_toast(
-            f"{count} Software Update{plural} Available!",
-            "Open Software Updater app to install new versions.",
-            icon_path=self.icon_path,
-            duration=5,
-            threaded=True,
-            callback_on_click=self._launch_updater,
+        self.tray.showMessage(
+            f"{count} Software Update{plural} Available",
+            "Open Software Updater to install new versions.",
+            QSystemTrayIcon.MessageIcon.Information,
+            7000,
         )
 
-    # ------------------------------------------------------------------
-    # Core functionality
-    # ------------------------------------------------------------------
     def check_for_updates(self) -> None:
-        """Check for available software updates via winget."""
-
-        def run_command_silently(command: List[str]) -> subprocess.CompletedProcess:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            return subprocess.run(
-                command,
-                startupinfo=startupinfo,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
         try:
-            result = run_command_silently(["winget", "upgrade", "--accept-source-agreements"])
-            lines = result.stdout.split("\n")
-            start_index = 0
-            for i, line in enumerate(lines):
-                if line.startswith("Name") and "Id" in line:
-                    start_index = i + 1
-                    break
-            lines = lines[start_index:]
-            self.updates = []
-            count = 0
+            result = run_winget(["winget", "upgrade"])
+            entries = parse_upgrade_output(result.stdout or "")
+            updates = []
             skipped_changed = False
-            for line in lines:
-                # Skip empty and header lines
-                if line.strip() and not line.startswith("-"):
-                    # Remove stray 'winget' tokens from the line
-                    line = line.replace("winget", "")
-                    pattern = r"^(.*?)\s+([^\s]+)\s+([^\s]+\s*(?:\([^\)]+\))?)\s+([^\s]+\s*(?:\([^\)]+\))?)$"
-                    match = re.match(pattern, line.strip())
-                    parts: List[str] = []
-                    if match:
-                        parts = [
-                            match.group(1).strip(),
-                            match.group(2).strip(),
-                            match.group(3).strip(),
-                            match.group(4).strip(),
-                        ]
-                    if len(parts) >= 4:
-                        name, package_id, installed_version, available_version = parts
-                        # Skip fake or excluded packages entirely
-                        if (package_id in self.fake_updates and self.fake_updates[package_id] == available_version) or (
-                            package_id in self.excluded_updates
-                        ):
-                            continue
-                        # Respect per-version skip list
-                        skip_version = self.skipped_updates.get(package_id)
-                        if skip_version == available_version:
-                            # User chose to skip this exact version
-                            continue
-                        if skip_version is not None and skip_version != available_version:
-                            # Newer version available; clear the old skip entry
-                            self.skipped_updates.pop(package_id, None)
-                            skipped_changed = True
-                        # Otherwise include in updates list
-                        self.updates.append(
-                            {
-                                "name": name,
-                                "id": package_id,
-                                "installed_version": installed_version,
-                                "available_version": available_version,
-                            }
-                        )
-                        count += 1
-            # Only show notification if there are pending updates
-            print(self.updates)
-            if count:
-                self.show_notification(count)
-            # Persist any cleared skip entries
+            for parts in entries:
+                name, package_id, installed_version, available_version = parts[:4]
+                if (package_id in self.fake_updates and self.fake_updates[package_id] == available_version) or (
+                    package_id in self.excluded_updates
+                ):
+                    continue
+                skip_version = self.skipped_updates.get(package_id)
+                if skip_version == available_version:
+                    continue
+                if skip_version is not None and skip_version != available_version:
+                    self.skipped_updates.pop(package_id, None)
+                    skipped_changed = True
+                updates.append(package_id)
             if skipped_changed:
-                self._save_json(self.skipped_updates_file, self.skipped_updates)
-        except subprocess.CalledProcessError:
-            # Winget not found or another non‑zero return; silently ignore
-            pass
+                save_json(self.skipped_updates_file, self.skipped_updates)
+            if updates:
+                self.show_notification(len(updates))
+                QTimer.singleShot(8000, self.app.quit)
+            else:
+                QTimer.singleShot(1200, self.app.quit)
+        except (subprocess.CalledProcessError, FileNotFoundError, TimeoutError):
+            QTimer.singleShot(1200, self.app.quit)
+
+
+def main() -> None:
+    notifier = UpdateNotifier()
+    if QApplication.instance():
+        sys.exit(QApplication.instance().exec())
 
 
 if __name__ == "__main__":
-    app = UpdateNotifier()
+    main()
