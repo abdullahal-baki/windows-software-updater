@@ -1,4 +1,5 @@
 # Windows Software Updater
+![Sample](/docs/sample.png)
 
 A polished PyQt6 desktop application that wraps the **Windows Package Manager
 (winget)** to scan for, install, and manage software updates — with a custom
@@ -9,6 +10,7 @@ frameless dark UI, live progress, system-tray notifications, and per-package
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![UI](https://img.shields.io/badge/UI-PyQt6-41cd52)
 ![License](https://img.shields.io/badge/license-MIT-green)
+
 
 ---
 
