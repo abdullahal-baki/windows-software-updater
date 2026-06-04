@@ -1,15 +1,33 @@
+# -- Build & packaging output --
+build/
 dist/
-dist
-build
-/dist
-/build
-*.spec
+*.spec.bak
+*.egg-info/
+.eggs/
+
+# -- Virtual environments --
+.venv/
+venv/
+env/
+
+# -- Python caches --
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# -- Logs --
 updater.log
-lab.py
-*.pyc
-# pyinstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name=Updater main.py
-# pyinstaller --onefile --noconsole --icon=icon.ico --add-data "icon.ico;." --name="Update Notifier" notifier.py
+
+# -- Runtime state files (written to %LOCALAPPDATA%, but ignore stray local copies) --
 fake_updates.json
 excluded_updates.json
-excluded_updates.json
 skipped_updates.json
+
+# -- IDE / OS --
+.idea/
+.vscode/
+*.swp
+Thumbs.db
